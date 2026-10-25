@@ -1,0 +1,45 @@
+{
+	"name": "pdf2epub",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"description": "Convert scanned PDF books into EPUB via local OCR, NLP confidence scoring, and per-page Markdown review",
+	"license": "MIT",
+	"packageManager": "pnpm@12.14.0",
+	"engines": {
+		"node": ">=24.0.0"
+	},
+	"bin": {
+		"pdf2epub": "./src/cli/index.ts"
+	},
+	"scripts": {
+		"start": "node ./src/cli/index.ts",
+		"lint": "biome check --write",
+		"lint:check": "biome check",
+		"typecheck": "tsc --noEmit",
+		"test": "vitest run",
+		"test:watch": "vitest",
+		"test:cov": "vitest run --coverage",
+		"prepare": "husky"
+	},
+	"dependencies": {
+		"commander": "^14.0.0",
+		"dictionary-en": "^4.0.0",
+		"jszip": "^3.10.1",
+		"nspell": "^2.1.5",
+		"tesseract.js": "^6.0.1",
+		"yaml": "^2.8.1",
+		"zod": "^4.0.0"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "2.5.15",
+		"@miguelriosoliveira/shared-configs": "github:miguelriosoliveira/shared-configs",
+		"@types/jszip": "^3.4.0",
+		"@types/node": "^26.6.5",
+		"@vitest/coverage-v8": "^5.0.5",
+		"husky": "^9.1.7",
+		"lint-staged": "^17.6.0",
+		"typescript": "^7.0.2",
+		"vitest": "^5.0.5"
+	}
+}

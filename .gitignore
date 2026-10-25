@@ -1,0 +1,27 @@
+# dependencies
+/node_modules
+
+# build & cache
+/dist
+/.cache
+/coverage
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+npm-debug.log*
+pnpm-debug.log*
+
+# local env files
+.env
+.env*.local
+
+# typescript
+*.tsbuildinfo
+
+# sample/workspace outputs
+/books
+test/*
+!test/*.test.ts

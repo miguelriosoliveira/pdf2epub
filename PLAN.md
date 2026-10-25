@@ -103,12 +103,12 @@ Regular high-confidence paragraphs remain completely untouched without noisy mar
 
 ## Implementation Checklist
 
-- [ ] `init-repo`: Initialize repository in `/Users/migrio/Projects/Personal/pdf2epub` with `pnpm`, `shared-configs` (Biome, tsconfig, copy-only dotfiles), and core dependencies (`zod`, `commander`, `nspell`, `gray-matter`, `archiver`/`jszip`).
-- [ ] `domain-schemas`: Define Zod domain schemas in `src/types/domain.ts` for OCR output, bounding boxes, confidence breakdown, page frontmatter, and `book.json` manifest.
-- [ ] `ocr-providers`: Build macOS Vision + PDFKit Swift helper (`swift/vision-ocr.swift`) and `VisionOcrProvider`, plus cross-platform `TesseractOcrProvider` fallback in `src/ocr/`.
-- [ ] `nlp-confidence`: Implement layout reconstruction (header/footer stripping, de-hyphenation, cross-page continuation detection) and multi-signal local NLP confidence scorer in `src/nlp/`.
-- [ ] `markdown-serializer`: Implement per-page Markdown serializer/parser (`pages/page-NNNN.md` with frontmatter and `@flagged` block comments) in `src/markdown/page-serializer.ts`.
-- [ ] `llm-repair`: Implement targeted cropped-bbox LLM repair service with dry-run cost estimator and max-block budget cap in `src/llm/repair.ts`.
-- [ ] `epub-builder`: Implement EPUB 3 compiler (cross-page paragraph stitching, chapter splitting, OPF/XHTML/TOC packaging) in `src/epub/builder.ts`.
-- [ ] `cli-and-webui`: Build CLI commands (`scan`, `status`, `fix-flagged`, `review`, `build`) in `src/cli/index.ts` and the on-demand local split-pane review web UI in `src/web/server.ts`.
-- [ ] `unit-tests`: Add unit tests for layout reconstruction, multi-signal confidence scoring, Markdown round-trip serialization, and EPUB cross-page stitching.
+- [x] `init-repo`: Initialize repository in `/Users/migrio/Projects/Personal/pdf2epub` with `pnpm`, `shared-configs` (Biome, tsconfig, copy-only dotfiles), and core dependencies (`zod`, `commander`, `nspell`, `gray-matter`, `archiver`/`jszip`).
+- [x] `domain-schemas`: Define Zod domain schemas in `src/types/domain.ts` for OCR output, bounding boxes, confidence breakdown, page frontmatter, and `book.json` manifest.
+- [x] `ocr-providers`: Build macOS Vision + PDFKit Swift helper (`swift/vision-ocr.swift`) and `VisionOcrProvider`, plus cross-platform `TesseractOcrProvider` fallback in `src/ocr/`.
+- [x] `nlp-confidence`: Implement layout reconstruction (header/footer stripping, de-hyphenation, cross-page continuation detection) and multi-signal local NLP confidence scorer in `src/nlp/`.
+- [x] `markdown-serializer`: Implement per-page Markdown serializer/parser (`pages/page-NNNN.md` with frontmatter and `@flagged` block comments) in `src/markdown/page-serializer.ts`.
+- [x] `llm-repair`: Implement targeted cropped-bbox LLM repair service with dry-run cost estimator and max-block budget cap in `src/llm/repair.ts`.
+- [x] `epub-builder`: Implement EPUB 3 compiler (cross-page paragraph stitching, chapter splitting, OPF/XHTML/TOC packaging) in `src/epub/builder.ts`.
+- [x] `cli-and-webui`: Build CLI commands (`scan`, `status`, `fix-flagged`, `review`, `build`) in `src/cli/index.ts` and the on-demand local split-pane review web UI in `src/web/server.ts`.
+- [x] `unit-tests`: Add unit tests for layout reconstruction, multi-signal confidence scoring, Markdown round-trip serialization, and EPUB cross-page stitching.

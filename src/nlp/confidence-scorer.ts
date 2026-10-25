@@ -1,0 +1,290 @@
+import dictionaryEn from 'dictionary-en';
+import nspell, { type NSpellInstance } from 'nspell';
+import type { ConfidenceBreakdown, OcrLine, OcrPageResult, TextBlock } from '../types/domain.ts';
+import type { RawReconstructedBlock } from './layout-reconstructor.ts';
+
+let cachedSpellChecker: NSpellInstance | null = null;
+
+function getSpellChecker(): NSpellInstance {
+	if (!cachedSpellChecker) {
+		cachedSpellChecker = nspell(dictionaryEn);
+	}
+	return cachedSpellChecker;
+}
+
+const ALLOWED_ALPHANUMERIC_TOKENS = new Set([
+	'o1',
+	'3d',
+	'2d',
+	'v1',
+	'v2',
+	'v3',
+	'v4',
+	'v8',
+	'utf8',
+	'utf16',
+	'base64',
+	'int32',
+	'int64',
+	'uint8',
+	'uint32',
+	'float32',
+	'float64',
+	'arm64',
+	'x86',
+	'x64',
+	'mp3',
+	'mp4',
+	'h264',
+	'sha256',
+	'md5',
+	'1st',
+	'2nd',
+	'3rd',
+	'4th',
+	'5th',
+	'6th',
+	'7th',
+	'8th',
+	'9th',
+	'10th',
+]);
+
+const VALID_SINGLE_LETTER_WORDS = new Set(['a', 'A', 'I', 'o', 'O']);
+
+const DIGIT_INSIDE_WORD_REGEX = /\b[A-Za-z]+[0-9]+[A-Za-z0-9]*\b|\b[0-9]+[A-Za-z]+[0-9]+\b/g;
+const STRAY_OCR_NOISE_REGEX = /[|~^§¤¦¨´¸¬°±]/g;
+const IMPOSSIBLE_CONSONANTS_REGEX = /\b[A-Za-z]*[bcdfghjklmnpqrstvwxz]{6,}[A-Za-z]*\b/gi;
+const REPEATED_PUNCTUATION_REGEX = /(?:[,;:]{2,}|[!?]{4,}|\.{4,})/g;
+
+function clamp01(val: number): number {
+	return Math.min(1, Math.max(0, val));
+}
+
+function round4(val: number): number {
+	return Math.round(val * 10000) / 10000;
+}
+
+export function extractWords(text: string): string[] {
+	const rawTokens = text.match(/[\p{L}\p{N}'’_-]+/gu) ?? [];
+	return rawTokens
+		.map(token => token.replace(/^['’_-]+|['’_-]+$/g, ''))
+		.filter(token => token.length > 0);
+}
+
+export function buildBookVocabulary(
+	pages: readonly OcrPageResult[],
+	minFrequency = 3,
+): ReadonlySet<string> {
+	const counts = new Map<string, number>();
+	for (const page of pages) {
+		for (const line of page.lines) {
+			for (const word of extractWords(line.text)) {
+				if (/^\p{L}{3,}$/u.test(word)) {
+					const lower = word.toLowerCase();
+					counts.set(lower, (counts.get(lower) ?? 0) + 1);
+				}
+			}
+		}
+	}
+
+	const frequent = new Set<string>();
+	for (const [word, count] of counts) {
+		if (count >= minFrequency) {
+			frequent.add(word);
+		}
+	}
+	return frequent;
+}
+
+function splitIdentifierSubwords(word: string): string[] {
+	return word
+		.replace(/([a-z])([A-Z])/g, '$1 $2')
+		.replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
+		.split(/[\s_-]+/)
+		.filter(Boolean);
+}
+
+export function isWordLexicallyValid(
+	rawWord: string,
+	spell: NSpellInstance,
+	bookVocab: ReadonlySet<string>,
+): boolean {
+	if (/^\d+(?:[.,]\d+)*$/.test(rawWord)) {
+		return true;
+	}
+	if (/^(?:[IVXLCDM]+|[ivxlcdm]+)$/.test(rawWord) && rawWord.length <= 6) {
+		return true;
+	}
+	if (rawWord.length === 1) {
+		return VALID_SINGLE_LETTER_WORDS.has(rawWord);
+	}
+
+	const normalizedApostrophe = rawWord.replace(/’/g, "'");
+	const strippedPossessive = normalizedApostrophe.replace(/'s$/i, '');
+	const lower = strippedPossessive.toLowerCase();
+
+	if (ALLOWED_ALPHANUMERIC_TOKENS.has(lower)) {
+		return true;
+	}
+	if (bookVocab.has(lower)) {
+		return true;
+	}
+	if (spell.correct(strippedPossessive) || spell.correct(lower)) {
+		return true;
+	}
+
+	const subwords = splitIdentifierSubwords(strippedPossessive);
+	if (subwords.length > 1) {
+		return subwords.every(
+			sub =>
+				sub.length <= 1 ||
+				spell.correct(sub) ||
+				spell.correct(sub.toLowerCase()) ||
+				bookVocab.has(sub.toLowerCase()),
+		);
+	}
+
+	return false;
+}
+
+export function computeOcrLineScore(lines: readonly OcrLine[]): number {
+	if (lines.length === 0) {
+		return 1;
+	}
+	let weightedSum = 0;
+	let totalWeight = 0;
+	let minLineConf = 1;
+
+	for (const line of lines) {
+		const weight = Math.max(1, line.text.length);
+		weightedSum += line.confidence * weight;
+		totalWeight += weight;
+		minLineConf = Math.min(minLineConf, line.confidence);
+	}
+
+	const weightedMean = totalWeight > 0 ? weightedSum / totalWeight : 1;
+	return clamp01(weightedMean * 0.7 + minLineConf * 0.3);
+}
+
+export interface GarbleAnalysis {
+	score: number;
+	anomalyCount: number;
+}
+
+export function analyzeGarbleHeuristics(text: string): GarbleAnalysis {
+	if (!text.trim()) {
+		return { score: 1, anomalyCount: 0 };
+	}
+
+	let anomalyCount = 0;
+
+	const digitInsideMatches = text.match(DIGIT_INSIDE_WORD_REGEX) ?? [];
+	for (const match of digitInsideMatches) {
+		if (!ALLOWED_ALPHANUMERIC_TOKENS.has(match.toLowerCase())) {
+			anomalyCount += 1;
+		}
+	}
+
+	const straySymbols = text.match(STRAY_OCR_NOISE_REGEX) ?? [];
+	anomalyCount += straySymbols.length;
+
+	const consonantRuns = text.match(IMPOSSIBLE_CONSONANTS_REGEX) ?? [];
+	anomalyCount += consonantRuns.length;
+
+	const repeatedPunct = text.match(REPEATED_PUNCTUATION_REGEX) ?? [];
+	anomalyCount += repeatedPunct.length;
+
+	const words = text.split(/\s+/);
+	let consecutiveSingleLetters = 0;
+	for (const w of words) {
+		const clean = w.replace(/[^\p{L}]/gu, '');
+		if (clean.length === 1 && !VALID_SINGLE_LETTER_WORDS.has(clean)) {
+			consecutiveSingleLetters += 1;
+			if (consecutiveSingleLetters >= 2) {
+				anomalyCount += 1;
+			}
+		} else {
+			consecutiveSingleLetters = 0;
+		}
+	}
+
+	const wordCount = Math.max(4, words.length);
+	const penalty = (anomalyCount * 2.2) / Math.max(6, Math.sqrt(wordCount) * 3);
+	return {
+		score: clamp01(1 - penalty),
+		anomalyCount,
+	};
+}
+
+export function scoreBlockConfidence(
+	block: RawReconstructedBlock,
+	options: {
+		threshold?: number;
+		bookVocab?: ReadonlySet<string>;
+	} = {},
+): ConfidenceBreakdown {
+	const threshold = options.threshold ?? 0.82;
+	const bookVocab = options.bookVocab ?? new Set<string>();
+	const spell = getSpellChecker();
+
+	const ocrScore = computeOcrLineScore(block.lines);
+
+	const words = extractWords(block.text);
+	const oovWords: string[] = [];
+	for (const word of words) {
+		if (!isWordLexicallyValid(word, spell, bookVocab)) {
+			oovWords.push(word);
+		}
+	}
+
+	const effectiveWordCount = Math.max(3, words.length);
+	const oovRatio = oovWords.length / effectiveWordCount;
+	const dictScore = clamp01(1 - oovRatio * 1.6);
+
+	const garble = analyzeGarbleHeuristics(block.text);
+	const composite = clamp01(0.45 * ocrScore + 0.3 * dictScore + 0.25 * garble.score);
+
+	const reasons: string[] = [];
+	if (ocrScore < threshold) {
+		reasons.push(`ocr:${ocrScore.toFixed(2)}`);
+	}
+	if (oovWords.length > 0) {
+		const sample = oovWords.slice(0, 3).join(',');
+		reasons.push(`oov:${oovWords.length}(${sample})`);
+	}
+	if (garble.anomalyCount > 0) {
+		reasons.push(`garble:${garble.anomalyCount}`);
+	}
+
+	const flagged =
+		composite < threshold ||
+		ocrScore < threshold - 0.1 ||
+		garble.anomalyCount >= 2 ||
+		(oovWords.length >= 2 && dictScore < 0.72);
+
+	return {
+		composite: round4(composite),
+		ocr: round4(ocrScore),
+		dictionary: round4(dictScore),
+		garble: round4(garble.score),
+		flagged,
+		reasons,
+	};
+}
+
+export function scorePageBlocks(
+	rawBlocks: readonly RawReconstructedBlock[],
+	options: {
+		threshold?: number;
+		bookVocab?: ReadonlySet<string>;
+	} = {},
+): TextBlock[] {
+	return rawBlocks.map(raw => ({
+		id: raw.id,
+		kind: raw.kind,
+		text: raw.text,
+		bbox: raw.bbox,
+		confidence: scoreBlockConfidence(raw, options),
+	}));
+}

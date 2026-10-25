@@ -1,0 +1,11 @@
+{
+	"extends": "@miguelriosoliveira/shared-configs/tsconfig/node",
+	"compilerOptions": {
+		"strict": true,
+		"noUncheckedIndexedAccess": true,
+		"exactOptionalPropertyTypes": true,
+		"allowImportingTsExtensions": true,
+		"types": ["node"]
+	},
+	"include": ["src", "test"]
+}
