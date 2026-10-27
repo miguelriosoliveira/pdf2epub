@@ -378,6 +378,126 @@ describe('EPUB 3 stitching and archive builder', () => {
 		const ch1Xml = await zip.file('OEBPS/chapter-001.xhtml')?.async('string');
 		expect(ch1Xml).toContain('data structures for coding interviews');
 	});
+
+	it('consolidates fragmented TOC dot-leader rows and renders responsive .toc-leader XHTML in EPUB', async () => {
+		const tocPage: OcrPageResult = {
+			page: 8,
+			widthPx: 1492,
+			heightPx: 2196,
+			lines: [
+				{
+					text: 'Introduction.',
+					confidence: 1,
+					bbox: { x: 0.089, y: 0.0712, width: 0.115, height: 0.0102 },
+				},
+				{
+					text: '. 2',
+					confidence: 0.5,
+					bbox: { x: 0.88, y: 0.071, width: 0.021, height: 0.0104 },
+				},
+				{
+					text: 'I.',
+					confidence: 1,
+					bbox: { x: 0.091, y: 0.0944, width: 0.012, height: 0.0101 },
+				},
+				{
+					text: 'The Interview Process',
+					confidence: 1,
+					bbox: { x: 0.132, y: 0.0942, width: 0.179, height: 0.0104 },
+				},
+				{
+					text: '4',
+					confidence: 1,
+					bbox: { x: 0.888, y: 0.0944, width: 0.012, height: 0.0101 },
+				},
+				{
+					text: '....',
+					confidence: 1,
+					bbox: { x: 0.316, y: 0.1002, width: 0.108, height: 0.0043 },
+				},
+				{
+					text: 'Why?',
+					confidence: 1,
+					bbox: { x: 0.13, y: 0.1177, width: 0.047, height: 0.013 },
+				},
+				{
+					text: '4',
+					confidence: 1,
+					bbox: { x: 0.888, y: 0.1177, width: 0.012, height: 0.0101 },
+				},
+				{
+					text: '....aaa',
+					confidence: 0.3,
+					bbox: { x: 0.384, y: 0.125, width: 0.128, height: 0.0029 },
+				},
+			],
+		};
+
+		const layout = reconstructPageLayout(tocPage);
+		expect(layout.blocks.map(b => b.text)).toEqual([
+			'Introduction ... 2',
+			'I. The Interview Process ... 4',
+			'Why? ... 4',
+		]);
+
+		const workspaceDir = createTempDir();
+		const now = new Date().toISOString();
+		writePageFile(workspaceDir, {
+			frontmatter: {
+				page: 8,
+				status: 'clean',
+				confidence: 0.99,
+				flaggedBlocks: 0,
+				continuesFromPrev: false,
+				continuesToNext: false,
+			},
+			blocks: layout.blocks.map(b => ({
+				id: b.id,
+				kind: b.kind,
+				text: b.text,
+				bbox: b.bbox,
+				confidence: {
+					composite: 0.99,
+					ocr: 0.99,
+					dictionary: 1,
+					garble: 1,
+					flagged: false,
+					reasons: [],
+				},
+			})),
+		});
+		writeBookManifest(workspaceDir, {
+			title: 'Sample TOC Book',
+			author: 'Test Author',
+			language: 'en',
+			sourcePdf: '/tmp/fake.pdf',
+			totalPages: 1,
+			scannedPages: [8],
+			threshold: 0.82,
+			ocrEngine: 'macos-vision',
+			createdAt: now,
+			updatedAt: now,
+			stats: {
+				cleanPages: 1,
+				flaggedPages: 0,
+				reviewedPages: 0,
+				totalFlaggedBlocks: 0,
+			},
+		});
+
+		const epubPath = join(workspaceDir, 'toc.epub');
+		await buildEpubFromWorkspace({ bookDir: workspaceDir, outputPath: epubPath });
+		const zip = await JSZip.loadAsync(
+			await import('node:fs/promises').then(fs => fs.readFile(epubPath)),
+		);
+		const ch1Xml = await zip.file('OEBPS/chapter-001.xhtml')?.async('string');
+		expect(ch1Xml).toContain(
+			'<p class="toc-row"><span class="toc-label">I. The Interview Process</span><span class="toc-leader" aria-hidden="true"></span><span class="toc-page">4</span></p>',
+		);
+		const css = await zip.file('OEBPS/styles.css')?.async('string');
+		expect(css).toContain('.toc-leader');
+		expect(css).toContain('border-bottom: 1px dotted currentColor;');
+	});
 });
 
 describe('CLI page option parser', () => {

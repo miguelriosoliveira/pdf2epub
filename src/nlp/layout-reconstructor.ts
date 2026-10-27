@@ -57,6 +57,15 @@ const STANDALONE_PAGE_NUMBER_REGEX =
 
 const RUNNING_HEADER_PAGE_NUM_REGEX = /^(?:\d{1,4}\s*[|•—-]\s*.+|.+\s*[|•—-]\s*\d{1,4})$/;
 
+export const TOC_ENTRY_LINE_REGEX = /^(.+?)\s+\.{3,}\s+(\d{1,4}|[ivxlcdm]{1,8})$/i;
+
+const PURE_DOT_LEADER_REGEX = /^[.•·…\s_-]+$/;
+const NOISY_DOT_LEADER_REGEX = /^[.•·…\s]{3,}[a-z0-9.•·…\s]{0,4}$/i;
+const RIGHT_PAGE_TOKEN_REGEX = /^[:\-•·….\s]*(\d{1,4}|[ivxlcdm]{1,8})[.•·…\s]*$/i;
+const TRAILING_DOT_LEADER_IN_TEXT_REGEX = /(?:\s*[.•·…]{2,}[\s.•·…]*)+$/;
+const INLINE_TOC_WITH_DOTS_REGEX =
+	/^(.+?)\s*[.•·…]{2,}[\s:.\-•·…]*(\d{1,4}|[ivxlcdm]{1,8})[.•·…\s]*$/i;
+
 function normalizeHeaderFooterKey(text: string): string {
 	return text
 		.toLowerCase()
@@ -68,7 +77,7 @@ function normalizeHeaderFooterKey(text: string): string {
 function isTopOrBottomMargin(line: OcrLine): boolean {
 	const top = line.bbox.y;
 	const bottom = line.bbox.y + line.bbox.height;
-	return top < 0.085 || bottom > 0.915;
+	return top < 0.058 || bottom > 0.915;
 }
 
 export function detectRepeatingMarginKeys(pages: readonly OcrPageResult[]): Set<string> {
@@ -117,11 +126,11 @@ export function isRunningHeaderOrFooter(
 
 function computeMedian(values: readonly number[]): number {
 	if (values.length === 0) {
-		return 0.018;
+		return 0.012;
 	}
 	const sorted = [...values].sort((a, b) => a - b);
 	const mid = Math.floor(sorted.length / 2);
-	return sorted[mid] ?? 0.018;
+	return sorted[mid] ?? 0.012;
 }
 
 export function mergeBBoxes(lines: readonly OcrLine[]): NormalizedBBox {
@@ -147,6 +156,212 @@ export function mergeBBoxes(lines: readonly OcrLine[]): NormalizedBBox {
 		width: Math.min(1, Math.max(0, maxX - minX)),
 		height: Math.min(1, Math.max(0, maxY - minY)),
 	};
+}
+
+function isDotLeaderSegment(line: OcrLine, medianHeight: number): boolean {
+	const trimmed = line.text.trim();
+	if (!trimmed) {
+		return true;
+	}
+	if (PURE_DOT_LEADER_REGEX.test(trimmed)) {
+		return true;
+	}
+	if (line.bbox.height <= medianHeight * 0.6 && NOISY_DOT_LEADER_REGEX.test(trimmed)) {
+		return true;
+	}
+	return false;
+}
+
+function normalizeRomanNumeralPrefix(text: string): string {
+	return text.replace(/^([IVXLCDMixvxlcdml]+)(\.\s+)/, (full, prefix: string, suffix: string) => {
+		const normalized = prefix.replace(/l/g, 'I').toUpperCase();
+		return /^[IVXLCDM]+$/.test(normalized) ? `${normalized}${suffix}` : full;
+	});
+}
+
+function cleanTocLabel(rawLabel: string): string {
+	const strippedDots = rawLabel
+		.replace(TRAILING_DOT_LEADER_IN_TEXT_REGEX, '')
+		.replace(/[\s.•·…]+$/, '')
+		.replace(/\s+/g, ' ')
+		.trim();
+	return normalizeRomanNumeralPrefix(strippedDots);
+}
+
+function areLinesOnSameHorizontalRow(
+	rowLines: readonly OcrLine[],
+	candidate: OcrLine,
+	medianHeight: number,
+): boolean {
+	const textLines = rowLines.filter(l => l.bbox.height > medianHeight * 0.55);
+	const referenceLines = textLines.length > 0 ? textLines : rowLines;
+
+	const refTop = Math.min(...referenceLines.map(l => l.bbox.y));
+	const refBottom = Math.max(...referenceLines.map(l => l.bbox.y + l.bbox.height));
+	const refCenter = (refTop + refBottom) * 0.5;
+
+	const candTop = candidate.bbox.y;
+	const candBottom = candidate.bbox.y + candidate.bbox.height;
+	const candCenter = (candTop + candBottom) * 0.5;
+
+	const overlap = Math.min(refBottom, candBottom) - Math.max(refTop, candTop);
+	const minHeight = Math.min(refBottom - refTop, candidate.bbox.height);
+	if (minHeight > 0 && overlap / minHeight >= 0.35) {
+		return true;
+	}
+
+	if (Math.abs(candCenter - refCenter) <= medianHeight * 0.55) {
+		return true;
+	}
+
+	// Dot leaders sit along the bottom baseline of the row
+	if (Math.abs(candBottom - refBottom) <= medianHeight * 0.45) {
+		return true;
+	}
+
+	return false;
+}
+
+export function consolidateHorizontalRows(
+	lines: readonly OcrLine[],
+	medianHeight: number,
+): OcrLine[] {
+	if (lines.length === 0) {
+		return [];
+	}
+
+	const sortedByBaseline = [...lines].sort((a, b) => {
+		const aBottom = a.bbox.y + a.bbox.height;
+		const bBottom = b.bbox.y + b.bbox.height;
+		if (Math.abs(aBottom - bBottom) > medianHeight * 0.45) {
+			return a.bbox.y - b.bbox.y;
+		}
+		return a.bbox.x - b.bbox.x;
+	});
+
+	const rows: OcrLine[][] = [];
+	for (const line of sortedByBaseline) {
+		const currentRow = rows[rows.length - 1];
+		if (!currentRow || !areLinesOnSameHorizontalRow(currentRow, line, medianHeight)) {
+			rows.push([line]);
+		} else {
+			currentRow.push(line);
+		}
+	}
+
+	const consolidated: OcrLine[] = [];
+
+	for (const row of rows) {
+		row.sort((a, b) => a.bbox.x - b.bbox.x);
+
+		let hasDotLeader = false;
+		const meaningfulSegments: OcrLine[] = [];
+
+		for (const seg of row) {
+			if (isDotLeaderSegment(seg, medianHeight)) {
+				hasDotLeader = true;
+				continue;
+			}
+			if (TRAILING_DOT_LEADER_IN_TEXT_REGEX.test(seg.text)) {
+				hasDotLeader = true;
+			}
+			meaningfulSegments.push(seg);
+		}
+
+		if (meaningfulSegments.length === 0) {
+			continue;
+		}
+
+		if (meaningfulSegments.length === 1) {
+			const single = meaningfulSegments[0];
+			if (!single) continue;
+			const inlineMatch = single.text.trim().match(INLINE_TOC_WITH_DOTS_REGEX);
+			if (inlineMatch?.[1] && inlineMatch[2]) {
+				const label = cleanTocLabel(inlineMatch[1]);
+				const pageNum = inlineMatch[2].trim();
+				if (label && pageNum) {
+					consolidated.push({
+						text: `${label} ... ${pageNum}`,
+						confidence: single.confidence,
+						bbox: mergeBBoxes(row),
+					});
+					continue;
+				}
+			}
+
+			const cleanedSingleText = hasDotLeader
+				? cleanTocLabel(single.text)
+				: normalizeRomanNumeralPrefix(single.text.trim());
+			if (cleanedSingleText) {
+				consolidated.push({
+					text: cleanedSingleText,
+					confidence: single.confidence,
+					bbox: single.bbox,
+				});
+			}
+			continue;
+		}
+
+		const lastSeg = meaningfulSegments[meaningfulSegments.length - 1];
+		const prevSeg = meaningfulSegments[meaningfulSegments.length - 2];
+		const rightPageMatch = lastSeg?.text.trim().match(RIGHT_PAGE_TOKEN_REGEX);
+
+		const horizontalGap =
+			lastSeg && prevSeg ? lastSeg.bbox.x - (prevSeg.bbox.x + prevSeg.bbox.width) : 0;
+		const isRightAlignedPageNum =
+			Boolean(rightPageMatch?.[1]) &&
+			lastSeg !== undefined &&
+			(lastSeg.bbox.x >= 0.72 || hasDotLeader || horizontalGap >= 0.08);
+
+		if (isRightAlignedPageNum && rightPageMatch?.[1] && lastSeg) {
+			const pageToken = rightPageMatch[1];
+			const leftSegments = meaningfulSegments.slice(0, -1);
+			const rawLabel = leftSegments.map(s => s.text.trim()).join(' ');
+			const label = cleanTocLabel(rawLabel);
+
+			if (label) {
+				// Weight confidence primarily by the label segments so a leading dot before a page number (. 2) doesn't false-flag
+				const labelWeight = leftSegments.reduce((acc, s) => acc + Math.max(1, s.text.length), 0);
+				const labelWeightedConf =
+					leftSegments.reduce((acc, s) => acc + s.confidence * Math.max(1, s.text.length), 0) /
+					Math.max(1, labelWeight);
+				const pageConf = Math.max(0.88, lastSeg.confidence);
+				const rowConfidence = Math.min(1, labelWeightedConf * 0.9 + pageConf * 0.1);
+
+				consolidated.push({
+					text: `${label} ... ${pageToken}`,
+					confidence: rowConfidence,
+					bbox: mergeBBoxes(row),
+				});
+				continue;
+			}
+		}
+
+		// Standard multi-segment horizontal line (e.g. "I." + "The Interview Process")
+		const combinedText = normalizeRomanNumeralPrefix(
+			meaningfulSegments
+				.map(s => s.text.trim())
+				.join(' ')
+				.replace(/\s+/g, ' ')
+				.trim(),
+		);
+		const totalChars = meaningfulSegments.reduce((acc, s) => acc + Math.max(1, s.text.length), 0);
+		const weightedConf =
+			meaningfulSegments.reduce((acc, s) => acc + s.confidence * Math.max(1, s.text.length), 0) /
+			Math.max(1, totalChars);
+
+		consolidated.push({
+			text: combinedText,
+			confidence: weightedConf,
+			bbox: mergeBBoxes(meaningfulSegments),
+		});
+	}
+
+	return consolidated;
+}
+
+export function isTocEntryLine(text: string): boolean {
+	return TOC_ENTRY_LINE_REGEX.test(text.trim());
 }
 
 export function joinLinesWithDehyphenation(lines: readonly OcrLine[]): string {
@@ -184,6 +399,9 @@ function isHeadingLine(line: OcrLine, medianHeight: number, bodyWidth = 0.8): bo
 	if (!text || text.length > 95) {
 		return false;
 	}
+	if (isTocEntryLine(text)) {
+		return false;
+	}
 	if (/[,;.!?]$/.test(text) || LIST_ITEM_START_REGEX.test(text)) {
 		return false;
 	}
@@ -211,6 +429,10 @@ function shouldStartNewBlock(
 	leftMargin: number,
 	rightMargin: number,
 ): boolean {
+	if (isTocEntryLine(prevLine.text) || isTocEntryLine(currLine.text)) {
+		return true;
+	}
+
 	const bodyWidth = Math.max(0.2, rightMargin - leftMargin);
 	if (
 		isHeadingLine(prevLine, medianHeight, bodyWidth) ||
@@ -252,6 +474,9 @@ export function detectContinuesFromPrev(firstBlock: RawReconstructedBlock | unde
 		return false;
 	}
 	const trimmed = firstBlock.text.trim();
+	if (isTocEntryLine(trimmed)) {
+		return false;
+	}
 	return /^[a-z,;—–-]/.test(trimmed);
 }
 
@@ -260,7 +485,7 @@ export function detectContinuesToNext(lastBlock: RawReconstructedBlock | undefin
 		return false;
 	}
 	const trimmed = lastBlock.text.trim();
-	if (!trimmed) {
+	if (!trimmed || isTocEntryLine(trimmed)) {
 		return false;
 	}
 	// Short trailing signature or caption lines at the bottom of a page do not continue
@@ -275,15 +500,30 @@ export function reconstructPageLayout(
 	repeatingMarginKeys: ReadonlySet<string> = new Set(),
 ): ReconstructedPageLayout {
 	const strippedHeadersFooters: string[] = [];
-	const contentLines: OcrLine[] = [];
+	const rawContentLines: OcrLine[] = [];
 
 	for (const line of pageResult.lines) {
 		if (isRunningHeaderOrFooter(line, repeatingMarginKeys)) {
 			strippedHeadersFooters.push(line.text.trim());
 		} else {
-			contentLines.push(line);
+			rawContentLines.push(line);
 		}
 	}
+
+	if (rawContentLines.length === 0) {
+		return {
+			page: pageResult.page,
+			blocks: [],
+			continuesFromPrev: false,
+			continuesToNext: false,
+			strippedHeadersFooters,
+		};
+	}
+
+	const rawMedianHeight = computeMedian(
+		rawContentLines.filter(l => l.bbox.height > 0.006).map(l => l.bbox.height),
+	);
+	const contentLines = consolidateHorizontalRows(rawContentLines, rawMedianHeight);
 
 	if (contentLines.length === 0) {
 		return {

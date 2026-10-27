@@ -3,6 +3,7 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import JSZip from 'jszip';
 import { loadAllPageDocuments, readBookManifest } from '../markdown/page-serializer.ts';
+import { isTocEntryLine, TOC_ENTRY_LINE_REGEX } from '../nlp/layout-reconstructor.ts';
 import type { BookManifest, PageDocument } from '../types/domain.ts';
 
 export interface EpubParagraphItem {
@@ -69,7 +70,10 @@ export function stitchPagesAndGroupChapters(
 
 			const startsLikeContinuation = /^[a-z,;—–-]/.test(block.text.trim());
 			const prevEndsWithHyphen = prevItem ? /[-‐‑]$/.test(prevItem.text.trim()) : false;
+			const isToc =
+				isTocEntryLine(block.text) || (prevItem ? isTocEntryLine(prevItem.text) : false);
 			const shouldStitchWithPrevious =
+				!isToc &&
 				isFirstBlockOnPage &&
 				block.kind === 'paragraph' &&
 				prevItem?.kind === 'paragraph' &&
@@ -141,13 +145,33 @@ export function stitchPagesAndGroupChapters(
 	return { chapters, stitchedCount };
 }
 
+function renderParagraphOrTocXhtml(text: string): string {
+	const lines = text
+		.split(/\r?\n/)
+		.map(l => l.trim())
+		.filter(Boolean);
+
+	if (lines.length > 0 && lines.every(l => TOC_ENTRY_LINE_REGEX.test(l))) {
+		return lines
+			.map(line => {
+				const match = line.match(TOC_ENTRY_LINE_REGEX);
+				const label = match?.[1]?.trim() ?? line;
+				const pageNum = match?.[2]?.trim() ?? '';
+				return `\t\t<p class="toc-row"><span class="toc-label">${escapeXml(label)}</span><span class="toc-leader" aria-hidden="true"></span><span class="toc-page">${escapeXml(pageNum)}</span></p>`;
+			})
+			.join('\n');
+	}
+
+	return `\t\t<p>${escapeXml(text)}</p>`;
+}
+
 function renderChapterXhtml(chapter: EpubChapter, language: string): string {
 	const bodyHtml = chapter.items
 		.map(item => {
 			if (item.kind === 'heading') {
 				return `\t\t<h1>${escapeXml(item.text)}</h1>`;
 			}
-			return `\t\t<p>${escapeXml(item.text)}</p>`;
+			return renderParagraphOrTocXhtml(item.text);
 		})
 		.join('\n');
 
@@ -258,6 +282,26 @@ const DEFAULT_STYLES_CSS = [
 	'p {',
 	'\tmargin: 0 0 0.85em 0;',
 	'\ttext-align: justify;',
+	'}',
+	'p.toc-row {',
+	'\tdisplay: flex;',
+	'\talign-items: baseline;',
+	'\tgap: 0.4em;',
+	'\tmargin: 0 0 0.35em 0;',
+	'\ttext-align: left;',
+	'}',
+	'.toc-label {',
+	'\tflex: 0 1 auto;',
+	'}',
+	'.toc-leader {',
+	'\tflex: 1 1 1.5em;',
+	'\tborder-bottom: 1px dotted currentColor;',
+	'\topacity: 0.65;',
+	'\ttransform: translateY(-0.2em);',
+	'}',
+	'.toc-page {',
+	'\tflex: 0 0 auto;',
+	'\tfont-variant-numeric: tabular-nums;',
 	'}',
 	'',
 ].join('\n');

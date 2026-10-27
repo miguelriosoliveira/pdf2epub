@@ -50,10 +50,10 @@ const ALLOWED_ALPHANUMERIC_TOKENS = new Set([
 	'10th',
 ]);
 
-const VALID_SINGLE_LETTER_WORDS = new Set(['a', 'A', 'I', 'o', 'O']);
+const VALID_SINGLE_LETTER_WORDS = new Set(['a', 'A', 'i', 'I', 'o', 'O']);
 
 const DIGIT_INSIDE_WORD_REGEX = /\b[A-Za-z]+[0-9]+[A-Za-z0-9]*\b|\b[0-9]+[A-Za-z]+[0-9]+\b/g;
-const STRAY_OCR_NOISE_REGEX = /[|~^§¤¦¨´¸¬°±]/g;
+const STRAY_OCR_NOISE_REGEX = /[~^§¤¦¨´¸¬°±]|\|{2,}|(?<=[a-z])\|(?=[a-z])/g;
 const IMPOSSIBLE_CONSONANTS_REGEX = /\b[A-Za-z]*[bcdfghjklmnpqrstvwxz]{6,}[A-Za-z]*\b/gi;
 const REPEATED_PUNCTUATION_REGEX = /(?:[,;:]{2,}|[!?]{4,}|\.{4,})/g;
 
@@ -117,7 +117,7 @@ export function isWordLexicallyValid(
 		return true;
 	}
 	if (rawWord.length === 1) {
-		return VALID_SINGLE_LETTER_WORDS.has(rawWord);
+		return VALID_SINGLE_LETTER_WORDS.has(rawWord) || /^[A-Z]$/.test(rawWord);
 	}
 
 	const normalizedApostrophe = rawWord.replace(/’/g, "'");
@@ -132,6 +132,12 @@ export function isWordLexicallyValid(
 	}
 	if (spell.correct(strippedPossessive) || spell.correct(lower)) {
 		return true;
+	}
+	if (lower.endsWith('s') && lower.length > 4) {
+		const singular = lower.slice(0, -1);
+		if (spell.correct(singular) || bookVocab.has(singular)) {
+			return true;
+		}
 	}
 
 	const subwords = splitIdentifierSubwords(strippedPossessive);
@@ -177,22 +183,23 @@ export function analyzeGarbleHeuristics(text: string): GarbleAnalysis {
 		return { score: 1, anomalyCount: 0 };
 	}
 
+	const normalizedText = text.replace(/\s+\.{3,}\s+(?:\d{1,4}|[ivxlcdm]{1,8})$/i, '');
 	let anomalyCount = 0;
 
-	const digitInsideMatches = text.match(DIGIT_INSIDE_WORD_REGEX) ?? [];
+	const digitInsideMatches = normalizedText.match(DIGIT_INSIDE_WORD_REGEX) ?? [];
 	for (const match of digitInsideMatches) {
 		if (!ALLOWED_ALPHANUMERIC_TOKENS.has(match.toLowerCase())) {
 			anomalyCount += 1;
 		}
 	}
 
-	const straySymbols = text.match(STRAY_OCR_NOISE_REGEX) ?? [];
+	const straySymbols = normalizedText.match(STRAY_OCR_NOISE_REGEX) ?? [];
 	anomalyCount += straySymbols.length;
 
-	const consonantRuns = text.match(IMPOSSIBLE_CONSONANTS_REGEX) ?? [];
+	const consonantRuns = normalizedText.match(IMPOSSIBLE_CONSONANTS_REGEX) ?? [];
 	anomalyCount += consonantRuns.length;
 
-	const repeatedPunct = text.match(REPEATED_PUNCTUATION_REGEX) ?? [];
+	const repeatedPunct = normalizedText.match(REPEATED_PUNCTUATION_REGEX) ?? [];
 	anomalyCount += repeatedPunct.length;
 
 	const words = text.split(/\s+/);
