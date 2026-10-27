@@ -50,7 +50,7 @@ const ALLOWED_ALPHANUMERIC_TOKENS = new Set([
 	'10th',
 ]);
 
-const VALID_SINGLE_LETTER_WORDS = new Set(['a', 'A', 'i', 'I', 'o', 'O']);
+const VALID_SINGLE_LETTER_WORDS = new Set(['a', 'A', 'i', 'I', 'o', 'O', 'Θ', 'θ', 'Ω', 'ω']);
 
 const DIGIT_INSIDE_WORD_REGEX = /\b[A-Za-z]+[0-9]+[A-Za-z0-9]*\b|\b[0-9]+[A-Za-z]+[0-9]+\b/g;
 const STRAY_OCR_NOISE_REGEX = /[~^§¤¦¨´¸¬°±]|\|{2,}|(?<=[a-z])\|(?=[a-z])/g;

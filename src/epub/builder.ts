@@ -1,13 +1,14 @@
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, writeFileSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import JSZip from 'jszip';
 import { loadAllPageDocuments, readBookManifest } from '../markdown/page-serializer.ts';
+import { figureAssetPathFromMarkdown } from '../nlp/figure-detector.ts';
 import { isTocEntryLine, TOC_ENTRY_LINE_REGEX } from '../nlp/layout-reconstructor.ts';
 import type { BookManifest, PageDocument } from '../types/domain.ts';
 
 export interface EpubParagraphItem {
-	kind: 'heading' | 'paragraph';
+	kind: 'heading' | 'paragraph' | 'figure';
 	text: string;
 	sourcePages: number[];
 }
@@ -67,6 +68,8 @@ export function stitchPagesAndGroupChapters(
 
 			const isFirstBlockOnPage = bIdx === 0;
 			const prevItem = mergedItems[mergedItems.length - 1];
+			const figureAssetPath = figureAssetPathFromMarkdown(block.text);
+			const itemKind = figureAssetPath ? 'figure' : block.kind;
 
 			const startsLikeContinuation = /^[a-z,;—–-]/.test(block.text.trim());
 			const prevEndsWithHyphen = prevItem ? /[-‐‑]$/.test(prevItem.text.trim()) : false;
@@ -75,7 +78,7 @@ export function stitchPagesAndGroupChapters(
 			const shouldStitchWithPrevious =
 				!isToc &&
 				isFirstBlockOnPage &&
-				block.kind === 'paragraph' &&
+				itemKind === 'paragraph' &&
 				prevItem?.kind === 'paragraph' &&
 				(pageDoc.frontmatter.continuesFromPrev ||
 					prevEndsWithHyphen ||
@@ -94,7 +97,7 @@ export function stitchPagesAndGroupChapters(
 				stitchedCount += 1;
 			} else {
 				mergedItems.push({
-					kind: block.kind,
+					kind: itemKind,
 					text: block.text.trim(),
 					sourcePages: [pageDoc.frontmatter.page],
 				});
@@ -145,6 +148,14 @@ export function stitchPagesAndGroupChapters(
 	return { chapters, stitchedCount };
 }
 
+function renderFigureXhtml(markdown: string): string {
+	const match = markdown.match(/^!\[([^\]]+)\]\((figures\/page-\d{4}-figure-\d+\.png)\)$/);
+	if (!match?.[1] || !match[2]) {
+		return `\t\t<p>${escapeXml(markdown)}</p>`;
+	}
+	return `\t\t<figure><img src="${escapeXml(match[2])}" alt="${escapeXml(match[1])}" /></figure>`;
+}
+
 function renderParagraphOrTocXhtml(text: string): string {
 	const lines = text
 		.split(/\r?\n/)
@@ -170,6 +181,9 @@ function renderChapterXhtml(chapter: EpubChapter, language: string): string {
 		.map(item => {
 			if (item.kind === 'heading') {
 				return `\t\t<h1>${escapeXml(item.text)}</h1>`;
+			}
+			if (item.kind === 'figure') {
+				return renderFigureXhtml(item.text);
 			}
 			return renderParagraphOrTocXhtml(item.text);
 		})
@@ -221,7 +235,11 @@ function renderNavXhtml(title: string, chapters: readonly EpubChapter[], languag
 	].join('\n');
 }
 
-function renderContentOpf(manifest: BookManifest, chapters: readonly EpubChapter[]): string {
+function renderContentOpf(
+	manifest: BookManifest,
+	chapters: readonly EpubChapter[],
+	figurePaths: readonly string[],
+): string {
 	const bookUuid = `urn:uuid:${randomUUID()}`;
 	const modifiedIso = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
 
@@ -231,6 +249,10 @@ function renderContentOpf(manifest: BookManifest, chapters: readonly EpubChapter
 		...chapters.map(
 			ch =>
 				`\t\t<item id="${escapeXml(ch.id)}" href="${escapeXml(ch.filename)}" media-type="application/xhtml+xml" />`,
+		),
+		...figurePaths.map(
+			(path, index) =>
+				`\t\t<item id="figure-${String(index + 1).padStart(3, '0')}" href="${escapeXml(path)}" media-type="image/png" />`,
 		),
 	].join('\n');
 
@@ -303,6 +325,14 @@ const DEFAULT_STYLES_CSS = [
 	'\tflex: 0 0 auto;',
 	'\tfont-variant-numeric: tabular-nums;',
 	'}',
+	'figure {',
+	'\tmargin: 1.25em auto;',
+	'\ttext-align: center;',
+	'}',
+	'figure img {',
+	'\tmax-width: 100%;',
+	'\theight: auto;',
+	'}',
 	'',
 ].join('\n');
 
@@ -326,6 +356,19 @@ export async function buildEpubFromWorkspace(options: BuildEpubOptions): Promise
 	}
 
 	const { chapters, stitchedCount } = stitchPagesAndGroupChapters(pages, manifest.title);
+	const figurePaths = [
+		...new Set(
+			chapters.flatMap(chapter =>
+				chapter.items.flatMap(item => {
+					if (item.kind !== 'figure') {
+						return [];
+					}
+					const assetPath = figureAssetPathFromMarkdown(item.text);
+					return assetPath ? [assetPath] : [];
+				}),
+			),
+		),
+	];
 
 	const zip = new JSZip();
 	zip.file('mimetype', 'application/epub+zip', { compression: 'STORE' });
@@ -334,9 +377,14 @@ export async function buildEpubFromWorkspace(options: BuildEpubOptions): Promise
 	zip.file('OEBPS/nav.xhtml', renderNavXhtml(manifest.title, chapters, manifest.language), {
 		compression: 'DEFLATE',
 	});
-	zip.file('OEBPS/content.opf', renderContentOpf(manifest, chapters), {
+	zip.file('OEBPS/content.opf', renderContentOpf(manifest, chapters, figurePaths), {
 		compression: 'DEFLATE',
 	});
+	for (const figurePath of figurePaths) {
+		zip.file(`OEBPS/${figurePath}`, readFileSync(join(options.bookDir, 'pages', figurePath)), {
+			compression: 'STORE',
+		});
+	}
 
 	for (const chapter of chapters) {
 		zip.file(`OEBPS/${chapter.filename}`, renderChapterXhtml(chapter, manifest.language), {

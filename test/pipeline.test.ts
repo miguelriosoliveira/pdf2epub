@@ -1,6 +1,7 @@
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createServer as createTcpServer } from 'node:net';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import JSZip from 'jszip';
 import { afterEach, describe, expect, it } from 'vitest';
 import { parsePagesOption } from '../src/cli/index.ts';
@@ -17,10 +18,14 @@ import {
 	buildBookVocabulary,
 	detectRepeatingMarginKeys,
 	joinLinesWithDehyphenation,
+	processOcrPagesToDocuments,
 	reconstructPageLayout,
 	scoreBlockConfidence,
 } from '../src/nlp/index.ts';
+import type { OcrProvider, RenderPageImageOptions } from '../src/ocr/provider.ts';
+import { writeOcrPagesToWorkspace } from '../src/pipeline/scan-writer.ts';
 import type { OcrPageResult, PageDocument } from '../src/types/domain.ts';
+import { startReviewServer } from '../src/web/server.ts';
 
 const tempDirs: string[] = [];
 
@@ -28,6 +33,19 @@ function createTempDir(): string {
 	const dir = mkdtempSync(join(tmpdir(), 'pdf2epub-test-'));
 	tempDirs.push(dir);
 	return dir;
+}
+
+async function findAvailablePort(): Promise<number> {
+	const server = createTcpServer();
+	await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+	const address = server.address();
+	if (!address || typeof address === 'string') {
+		throw new Error('Could not determine an available test port');
+	}
+	await new Promise<void>((resolve, reject) =>
+		server.close(error => (error ? reject(error) : resolve())),
+	);
+	return address.port;
 }
 
 afterEach(() => {
@@ -166,6 +184,154 @@ describe('multi-signal NLP confidence scoring', () => {
 		const garble = analyzeGarbleHeuristics('Normal clean text without OCR artifacts.');
 		expect(garble.anomalyCount).toBe(0);
 		expect(garble.score).toBe(1);
+	});
+});
+
+describe('OCR asymptotic-notation recovery', () => {
+	it('uses nearby theta and omega labels to repair corrupted Greek symbols', () => {
+		const page: OcrPageResult = {
+			page: 51,
+			widthPx: 1600,
+			heightPx: 2200,
+			lines: [
+				{
+					text: 'Academics use big O, big O (theta), and big 22 (omega) to describe runtimes.',
+					confidence: 1,
+					bbox: { x: 0.1, y: 0.3, width: 0.7, height: 0.02 },
+				},
+				{
+					text: '• © (big theta): In academia, © means both 0 and S. © gives a tight bound.',
+					confidence: 1,
+					bbox: { x: 0.1, y: 0.45, width: 0.7, height: 0.02 },
+				},
+				{
+					text: '• 2 (big omega): In academia, Q is the equivalent concept but for lower bound. It is Ω(N), Q(log N), and Q(1).',
+					confidence: 1,
+					bbox: { x: 0.1, y: 0.6, width: 0.7, height: 0.02 },
+				},
+			],
+		};
+
+		const document = processOcrPagesToDocuments([page])[0];
+		const text = document?.blocks.map(block => block.text).join('\n') ?? '';
+
+		expect(text).toContain('Academics use big O, big Θ (theta), and big Ω (omega)');
+		expect(text).toContain(
+			'Θ (big theta): In academia, Θ means both O and Ω. Θ gives a tight bound.',
+		);
+		expect(text).toContain('Ω (big omega): In academia, Ω is the equivalent concept');
+		expect(text).toContain('It is Ω(N), Ω(log N), and Ω(1).');
+		const greekBlocks = document?.blocks.filter(block => /[ΘΩ]/u.test(block.text)) ?? [];
+		expect(
+			greekBlocks.every(
+				block => !block.confidence.reasons.some(reason => reason.startsWith('oov:')),
+			),
+		).toBe(true);
+	});
+
+	it('turns isolated graph labels into an inline crop covering the chart', () => {
+		const page: OcrPageResult = {
+			page: 51,
+			widthPx: 1600,
+			heightPx: 2200,
+			lines: [
+				{
+					text: 'No matter how big the constant is and how slow the linear increase is.',
+					confidence: 1,
+					bbox: { x: 0.1, y: 0.07, width: 0.8, height: 0.016 },
+				},
+				{
+					text: '0(1)',
+					confidence: 1,
+					bbox: { x: 0.417, y: 0.147, width: 0.045, height: 0.022 },
+				},
+				{
+					text: 'o(5)',
+					confidence: 1,
+					bbox: { x: 0.424, y: 0.214, width: 0.043, height: 0.022 },
+				},
+				{
+					text: 'There are many more runtimes than this.',
+					confidence: 1,
+					bbox: { x: 0.097, y: 0.289, width: 0.819, height: 0.017 },
+				},
+			],
+		};
+
+		const document = processOcrPagesToDocuments([page])[0];
+		const figure = document?.blocks.find(block => block.text.startsWith('![Figure from page 51]'));
+
+		expect(figure).toBeDefined();
+		expect(figure?.text).toBe('![Figure from page 51](figures/page-0051-figure-01.png)');
+		expect(figure?.bbox.x).toBeLessThan(0.39);
+		expect((figure?.bbox.x ?? 1) + (figure?.bbox.width ?? 0)).toBeGreaterThan(0.63);
+		expect(figure?.bbox.y).toBeLessThan(0.12);
+		expect((figure?.bbox.y ?? 0) + (figure?.bbox.height ?? 0)).toBeGreaterThan(0.27);
+		expect(document?.blocks.some(block => block.text === '0(1)' || block.text === 'o(5)')).toBe(
+			false,
+		);
+	});
+});
+
+describe('scan output with detected figures', () => {
+	it('writes the figure crop asset referenced by the page Markdown', async () => {
+		const bookDir = createTempDir();
+		const renderCalls: RenderPageImageOptions[] = [];
+		const provider: OcrProvider = {
+			engine: 'macos-vision',
+			getPdfPageCount: async () => 51,
+			recognizePages: async () => ({ totalPages: 51, pages: [] }),
+			renderPageImage: async options => {
+				renderCalls.push(options);
+				mkdirSync(dirname(options.outputPath), { recursive: true });
+				writeFileSync(options.outputPath, 'test image');
+				return options.outputPath;
+			},
+		};
+		const page: OcrPageResult = {
+			page: 51,
+			widthPx: 1600,
+			heightPx: 2200,
+			lines: [
+				{
+					text: 'No matter how big the constant is and how slow the linear increase is.',
+					confidence: 1,
+					bbox: { x: 0.1, y: 0.07, width: 0.8, height: 0.016 },
+				},
+				{
+					text: '0(1)',
+					confidence: 1,
+					bbox: { x: 0.417, y: 0.147, width: 0.045, height: 0.022 },
+				},
+				{
+					text: 'o(5)',
+					confidence: 1,
+					bbox: { x: 0.424, y: 0.214, width: 0.043, height: 0.022 },
+				},
+				{
+					text: 'There are many more runtimes than this.',
+					confidence: 1,
+					bbox: { x: 0.097, y: 0.289, width: 0.819, height: 0.017 },
+				},
+			],
+		};
+
+		await writeOcrPagesToWorkspace({
+			bookDir,
+			pdfPath: '/source/interview-book.pdf',
+			pages: [page],
+			provider,
+			dpi: 220,
+		});
+
+		const markdown = readFileSync(join(bookDir, 'pages', 'page-0051.md'), 'utf8');
+		const figurePath = join(bookDir, 'pages', 'figures', 'page-0051-figure-01.png');
+		expect(markdown).toContain('![Figure from page 51](figures/page-0051-figure-01.png)');
+		expect(existsSync(figurePath)).toBe(true);
+		expect(renderCalls).toHaveLength(1);
+		expect(renderCalls[0]?.pdfPath).toBe('/source/interview-book.pdf');
+		expect(renderCalls[0]?.page).toBe(51);
+		expect(renderCalls[0]?.crop?.x).toBeLessThan(0.39);
 	});
 });
 
@@ -498,11 +664,216 @@ describe('EPUB 3 stitching and archive builder', () => {
 		expect(css).toContain('.toc-leader');
 		expect(css).toContain('border-bottom: 1px dotted currentColor;');
 	});
+
+	it('packages detected Markdown figure crops as EPUB images', async () => {
+		const workspaceDir = createTempDir();
+		const now = new Date().toISOString();
+		const imagePath = 'figures/page-0051-figure-01.png';
+		mkdirSync(join(workspaceDir, 'pages', 'figures'), { recursive: true });
+		writeFileSync(join(workspaceDir, 'pages', imagePath), Buffer.from('test figure image'));
+		writePageFile(workspaceDir, {
+			frontmatter: {
+				page: 1,
+				status: 'clean',
+				confidence: 1,
+				flaggedBlocks: 0,
+				continuesFromPrev: false,
+				continuesToNext: false,
+			},
+			blocks: [
+				{
+					id: 'p1-b1',
+					kind: 'heading',
+					text: 'Chapter 1: Big O',
+					bbox: { x: 0.1, y: 0.1, width: 0.5, height: 0.03 },
+					confidence: {
+						composite: 1,
+						ocr: 1,
+						dictionary: 1,
+						garble: 1,
+						flagged: false,
+						reasons: [],
+					},
+				},
+				{
+					id: 'p1-figure-1',
+					kind: 'paragraph',
+					text: `![Figure from page 51](${imagePath})`,
+					bbox: { x: 0.2, y: 0.2, width: 0.4, height: 0.2 },
+					confidence: {
+						composite: 1,
+						ocr: 1,
+						dictionary: 1,
+						garble: 1,
+						flagged: false,
+						reasons: [],
+					},
+				},
+			],
+		});
+		writeBookManifest(workspaceDir, {
+			title: 'Interview Guide',
+			author: 'Test Author',
+			language: 'en',
+			sourcePdf: '/tmp/fake.pdf',
+			totalPages: 1,
+			scannedPages: [1],
+			threshold: 0.82,
+			ocrEngine: 'macos-vision',
+			createdAt: now,
+			updatedAt: now,
+			stats: {
+				cleanPages: 1,
+				flaggedPages: 0,
+				reviewedPages: 0,
+				totalFlaggedBlocks: 0,
+			},
+		});
+
+		const epubPath = join(workspaceDir, 'figures.epub');
+		await buildEpubFromWorkspace({ bookDir: workspaceDir, outputPath: epubPath });
+		const zip = await JSZip.loadAsync(
+			await import('node:fs/promises').then(fs => fs.readFile(epubPath)),
+		);
+		const chapter = await zip.file('OEBPS/chapter-001.xhtml')?.async('string');
+		const packageXml = await zip.file('OEBPS/content.opf')?.async('string');
+
+		expect(chapter).toContain(
+			'<img src="figures/page-0051-figure-01.png" alt="Figure from page 51" />',
+		);
+		expect(packageXml).toContain('href="figures/page-0051-figure-01.png" media-type="image/png"');
+		expect(await zip.file(`OEBPS/${imagePath}`)?.async('string')).toBe('test figure image');
+	});
 });
 
 describe('CLI page option parser', () => {
 	it('parses page range strings accurately', () => {
 		expect(parsePagesOption('all')).toBe('all');
 		expect(parsePagesOption('1-3, 7, 10-11')).toEqual([1, 2, 3, 7, 10, 11]);
+	});
+});
+
+describe('review page preview layout', () => {
+	it('keeps the overlay aligned with the full image in a scrollable preview', async () => {
+		const reviewServer = await startReviewServer({
+			bookDir: createTempDir(),
+			port: await findAvailablePort(),
+		});
+
+		try {
+			const response = await fetch(reviewServer.url);
+			const html = await response.text();
+			const paneStyles = html.match(/\.pane\s*\{([^}]*)\}/)?.[1] ?? '';
+			const canvasStyles = html.match(/\.canvas-wrap\s*\{([^}]*)\}/)?.[1] ?? '';
+
+			expect(response.ok).toBe(true);
+			expect(paneStyles).toMatch(/overflow:\s*auto/);
+			expect(canvasStyles).toMatch(/flex-shrink:\s*0/);
+		} finally {
+			await reviewServer.close();
+		}
+	});
+});
+
+describe('manual flagged-block review', () => {
+	it('accepts one block at a time and completes the page after the last block', async () => {
+		const bookDir = createTempDir();
+		const now = new Date().toISOString();
+		writePageFile(bookDir, {
+			frontmatter: {
+				page: 12,
+				status: 'needs-review',
+				confidence: 0.7,
+				flaggedBlocks: 2,
+				continuesFromPrev: false,
+				continuesToNext: false,
+			},
+			blocks: [
+				{
+					id: 'p12-b15',
+					kind: 'paragraph',
+					text: 'Rabin-Karp Substring Search ... 636',
+					bbox: { x: 0.13, y: 0.37, width: 0.77, height: 0.015 },
+					confidence: {
+						composite: 0.76,
+						ocr: 1,
+						dictionary: 0.2,
+						garble: 1,
+						flagged: true,
+						reasons: ['oov:2(Rabin-Karp,Substring)'],
+					},
+				},
+				{
+					id: 'p12-b24',
+					kind: 'paragraph',
+					text: 'Trie & TrieNode ... 649',
+					bbox: { x: 0.13, y: 0.58, width: 0.77, height: 0.012 },
+					confidence: {
+						composite: 0.7,
+						ocr: 1,
+						dictionary: 0,
+						garble: 1,
+						flagged: true,
+						reasons: ['oov:2(Trie,TrieNode)'],
+					},
+				},
+			],
+		});
+		writeBookManifest(bookDir, {
+			title: 'Interview Guide',
+			author: 'Test Author',
+			language: 'en',
+			sourcePdf: '/tmp/fake.pdf',
+			totalPages: 12,
+			scannedPages: [12],
+			threshold: 0.82,
+			ocrEngine: 'macos-vision',
+			createdAt: now,
+			updatedAt: now,
+			stats: {
+				cleanPages: 0,
+				flaggedPages: 1,
+				reviewedPages: 0,
+				totalFlaggedBlocks: 2,
+			},
+		});
+
+		const reviewServer = await startReviewServer({ bookDir, port: await findAvailablePort() });
+		try {
+			const htmlResponse = await fetch(reviewServer.url);
+			expect(await htmlResponse.text()).toContain('Accept Block');
+
+			const acceptBlock = (blockId: string) =>
+				fetch(`${reviewServer.url}/api/pages/12/accept`, {
+					method: 'POST',
+					headers: { 'content-type': 'application/json' },
+					body: JSON.stringify({ blockId }),
+				});
+			const loadPage = async () => {
+				const response = await fetch(`${reviewServer.url}/api/pages/12`);
+				return (await response.json()) as { document: PageDocument; markdown: string };
+			};
+
+			const firstAcceptance = await acceptBlock('p12-b15');
+			expect(firstAcceptance.ok).toBe(true);
+			const afterFirstAcceptance = await loadPage();
+			expect(afterFirstAcceptance.document.frontmatter.status).toBe('needs-review');
+			expect(afterFirstAcceptance.document.frontmatter.flaggedBlocks).toBe(1);
+			expect(afterFirstAcceptance.document.blocks[0]?.confidence.flagged).toBe(false);
+			expect(afterFirstAcceptance.document.blocks[1]?.confidence.flagged).toBe(true);
+			expect(afterFirstAcceptance.markdown).not.toContain('id="p12-b15"');
+			expect(afterFirstAcceptance.markdown).toContain('id="p12-b24"');
+
+			const lastAcceptance = await acceptBlock('p12-b24');
+			expect(lastAcceptance.ok).toBe(true);
+			const afterLastAcceptance = await loadPage();
+			expect(afterLastAcceptance.document.frontmatter.status).toBe('reviewed');
+			expect(afterLastAcceptance.document.frontmatter.flaggedBlocks).toBe(0);
+			expect(afterLastAcceptance.document.blocks.every(block => !block.confidence.flagged)).toBe(
+				true,
+			);
+		} finally {
+			await reviewServer.close();
+		}
 	});
 });

@@ -23,6 +23,10 @@ const RepairBlockBodySchema = z.object({
 	blockId: z.string().optional(),
 });
 
+const AcceptBlockBodySchema = z.object({
+	blockId: z.string().min(1),
+});
+
 function sendJson(res: ServerResponse, statusCode: number, data: unknown): void {
 	const payload = JSON.stringify(data);
 	res.writeHead(statusCode, {
@@ -122,6 +126,7 @@ const REVIEW_APP_HTML = `<!DOCTYPE html>
 	.canvas-wrap {
 		position: relative;
 		display: inline-block;
+		flex-shrink: 0;
 		width: 100%;
 		background: #090d16;
 		border: 1px solid var(--border);
@@ -168,6 +173,12 @@ const REVIEW_APP_HTML = `<!DOCTYPE html>
 		border-radius: 6px;
 		font-size: 12px;
 	}
+	.flagged-actions {
+		display: flex;
+		gap: 6px;
+		flex-shrink: 0;
+	}
+	button.accept { color: #4ade80; border-color: rgba(34, 197, 94, 0.6); }
 	.status-msg { font-size: 12px; color: var(--muted); }
 </style>
 </head>
@@ -275,11 +286,19 @@ const REVIEW_APP_HTML = `<!DOCTYPE html>
 			row.className = 'flagged-item';
 			const info = document.createElement('span');
 			info.textContent = block.id + ' — score ' + block.confidence.composite.toFixed(2) + ' [' + block.confidence.reasons.join(', ') + ']';
-			const btn = document.createElement('button');
-			btn.textContent = 'Repair Block with LLM';
-			btn.onclick = () => repairBlock(block.id);
+			const actions = document.createElement('div');
+			actions.className = 'flagged-actions';
+			const repairBtn = document.createElement('button');
+			repairBtn.textContent = 'Repair Block with LLM';
+			repairBtn.onclick = () => repairBlock(block.id);
+			const acceptBtn = document.createElement('button');
+			acceptBtn.className = 'accept';
+			acceptBtn.textContent = 'Accept Block';
+			acceptBtn.onclick = () => acceptBlock(block.id);
+			actions.appendChild(repairBtn);
+			actions.appendChild(acceptBtn);
 			row.appendChild(info);
-			row.appendChild(btn);
+			row.appendChild(actions);
 			flaggedContainer.appendChild(row);
 		}
 	}
@@ -316,6 +335,23 @@ const REVIEW_APP_HTML = `<!DOCTYPE html>
 			await selectPage(currentPage);
 		} else {
 			showToast('LLM Error: ' + data.error);
+		}
+	}
+
+	async function acceptBlock(blockId) {
+		if (currentPage === null) return;
+		const res = await fetch('/api/pages/' + currentPage + '/accept', {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({ blockId }),
+		});
+		if (res.ok) {
+			showToast('Accepted ' + blockId);
+			await loadBookOverview();
+			await selectPage(currentPage);
+		} else {
+			const err = await res.json();
+			showToast('Accept error: ' + err.error);
 		}
 	}
 
@@ -420,6 +456,41 @@ export async function startReviewServer(options: {
 				}
 				const result = await repairFlaggedBlocks(repairOpts);
 				sendJson(res, 200, result);
+				return;
+			}
+
+			const pageAcceptMatch = pathname.match(/^\/api\/pages\/(\d+)\/accept$/);
+			if (req.method === 'POST' && pageAcceptMatch?.[1]) {
+				const pageNum = Number.parseInt(pageAcceptMatch[1], 10);
+				const body = AcceptBlockBodySchema.parse(await readJsonBody(req));
+				const pagePath = join(bookDir, 'pages', formatPageFilename(pageNum));
+				const pageDoc = parsePageDocument(readFileSync(pagePath, 'utf8'));
+				const block = pageDoc.blocks.find(candidate => candidate.id === body.blockId);
+
+				if (!block) {
+					sendJson(res, 404, { error: `Block ${body.blockId} not found on page ${pageNum}` });
+					return;
+				}
+				if (!block.confidence.flagged) {
+					sendJson(res, 409, { error: `Block ${body.blockId} is not flagged` });
+					return;
+				}
+
+				block.confidence.flagged = false;
+				block.confidence.reasons = [];
+				const remainingFlaggedBlocks = pageDoc.blocks.filter(
+					candidate => candidate.confidence.flagged,
+				).length;
+				pageDoc.frontmatter.flaggedBlocks = remainingFlaggedBlocks;
+				pageDoc.frontmatter.status = remainingFlaggedBlocks > 0 ? 'needs-review' : 'reviewed';
+				writePageFile(bookDir, pageDoc);
+				syncManifestStats(bookDir);
+				sendJson(res, 200, {
+					ok: true,
+					acceptedBlockId: block.id,
+					remainingFlaggedBlocks,
+					status: pageDoc.frontmatter.status,
+				});
 				return;
 			}
 

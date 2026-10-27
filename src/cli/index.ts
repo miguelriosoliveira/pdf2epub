@@ -12,10 +12,9 @@ import {
 	loadAllPageDocuments,
 	readBookManifest,
 	writeBookManifest,
-	writePageFile,
 } from '../markdown/page-serializer.ts';
-import { processOcrPagesToDocuments } from '../nlp/index.ts';
 import { createOcrProvider } from '../ocr/index.ts';
+import { writeOcrPagesToWorkspace } from '../pipeline/scan-writer.ts';
 import type { BookManifest, OcrEngine } from '../types/domain.ts';
 import { startReviewServer } from '../web/server.ts';
 
@@ -113,10 +112,14 @@ export function createCliProgram(): Command {
 			});
 			process.stdout.write('\n');
 
-			const pageDocs = processOcrPagesToDocuments(ocrBatch.pages, { threshold });
-			for (const doc of pageDocs) {
-				writePageFile(outDir, doc);
-			}
+			await writeOcrPagesToWorkspace({
+				bookDir: outDir,
+				pdfPath,
+				pages: ocrBatch.pages,
+				provider,
+				dpi,
+				threshold,
+			});
 
 			const allDocs = loadAllPageDocuments(outDir);
 			const stats = computeBookStats(allDocs);
