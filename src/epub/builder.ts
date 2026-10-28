@@ -3,7 +3,11 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import JSZip from 'jszip';
 import { loadAllPageDocuments, readBookManifest } from '../markdown/page-serializer.ts';
-import { figureAssetPathFromMarkdown } from '../nlp/figure-detector.ts';
+import {
+	BOOK_COVER_ASSET_PATH,
+	figureAssetPathFromMarkdown,
+	isBookCoverMarkdown,
+} from '../nlp/figure-detector.ts';
 import { isTocEntryLine, TOC_ENTRY_LINE_REGEX } from '../nlp/layout-reconstructor.ts';
 import type { BookManifest, PageDocument } from '../types/domain.ts';
 
@@ -63,6 +67,9 @@ export function stitchPagesAndGroupChapters(
 		for (let bIdx = 0; bIdx < pageDoc.blocks.length; bIdx++) {
 			const block = pageDoc.blocks[bIdx];
 			if (!block?.text.trim()) {
+				continue;
+			}
+			if (pageDoc.frontmatter.page === 1 && isBookCoverMarkdown(block.text)) {
 				continue;
 			}
 
@@ -208,6 +215,26 @@ function renderChapterXhtml(chapter: EpubChapter, language: string): string {
 	].join('\n');
 }
 
+function renderCoverXhtml(language: string): string {
+	return [
+		'<?xml version="1.0" encoding="UTF-8"?>',
+		'<!DOCTYPE html>',
+		`<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" xml:lang="${escapeXml(language)}">`,
+		'<head>',
+		'\t<meta charset="UTF-8" />',
+		'\t<title>Cover</title>',
+		'\t<link rel="stylesheet" type="text/css" href="styles.css" />',
+		'</head>',
+		'<body class="cover-page">',
+		'\t<section epub:type="cover">',
+		'\t\t<img src="images/cover.png" alt="Book cover" />',
+		'\t</section>',
+		'</body>',
+		'</html>',
+		'',
+	].join('\n');
+}
+
 function renderNavXhtml(title: string, chapters: readonly EpubChapter[], language: string): string {
 	const links = chapters
 		.map(ch => `\t\t\t\t<li><a href="${escapeXml(ch.filename)}">${escapeXml(ch.title)}</a></li>`)
@@ -239,6 +266,7 @@ function renderContentOpf(
 	manifest: BookManifest,
 	chapters: readonly EpubChapter[],
 	figurePaths: readonly string[],
+	hasBookCover: boolean,
 ): string {
 	const bookUuid = `urn:uuid:${randomUUID()}`;
 	const modifiedIso = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
@@ -246,6 +274,12 @@ function renderContentOpf(
 	const manifestItems = [
 		'\t\t<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav" />',
 		'\t\t<item id="css" href="styles.css" media-type="text/css" />',
+		...(hasBookCover
+			? [
+					'\t\t<item id="cover" href="cover.xhtml" media-type="application/xhtml+xml" />',
+					'\t\t<item id="cover-image" href="images/cover.png" media-type="image/png" properties="cover-image" />',
+				]
+			: []),
 		...chapters.map(
 			ch =>
 				`\t\t<item id="${escapeXml(ch.id)}" href="${escapeXml(ch.filename)}" media-type="application/xhtml+xml" />`,
@@ -256,7 +290,10 @@ function renderContentOpf(
 		),
 	].join('\n');
 
-	const spineItems = chapters.map(ch => `\t\t<itemref idref="${escapeXml(ch.id)}" />`).join('\n');
+	const spineItems = [
+		...(hasBookCover ? ['\t\t<itemref idref="cover" />'] : []),
+		...chapters.map(ch => `\t\t<itemref idref="${escapeXml(ch.id)}" />`),
+	].join('\n');
 
 	return [
 		'<?xml version="1.0" encoding="UTF-8"?>',
@@ -333,6 +370,17 @@ const DEFAULT_STYLES_CSS = [
 	'\tmax-width: 100%;',
 	'\theight: auto;',
 	'}',
+	'.cover-page {',
+	'\tmargin: 0;',
+	'\tpadding: 0;',
+	'}',
+	'.cover-page img {',
+	'\tmax-width: 100%;',
+	'\tmax-height: 100vh;',
+	'\twidth: auto;',
+	'\tdisplay: block;',
+	'\tmargin: 0 auto;',
+	'}',
 	'',
 ].join('\n');
 
@@ -356,6 +404,10 @@ export async function buildEpubFromWorkspace(options: BuildEpubOptions): Promise
 	}
 
 	const { chapters, stitchedCount } = stitchPagesAndGroupChapters(pages, manifest.title);
+	const hasBookCover =
+		pages
+			.find(page => page.frontmatter.page === 1)
+			?.blocks.some(block => isBookCoverMarkdown(block.text)) ?? false;
 	const figurePaths = [
 		...new Set(
 			chapters.flatMap(chapter =>
@@ -377,9 +429,17 @@ export async function buildEpubFromWorkspace(options: BuildEpubOptions): Promise
 	zip.file('OEBPS/nav.xhtml', renderNavXhtml(manifest.title, chapters, manifest.language), {
 		compression: 'DEFLATE',
 	});
-	zip.file('OEBPS/content.opf', renderContentOpf(manifest, chapters, figurePaths), {
+	zip.file('OEBPS/content.opf', renderContentOpf(manifest, chapters, figurePaths, hasBookCover), {
 		compression: 'DEFLATE',
 	});
+	if (hasBookCover) {
+		zip.file('OEBPS/cover.xhtml', renderCoverXhtml(manifest.language), { compression: 'DEFLATE' });
+		zip.file(
+			'OEBPS/images/cover.png',
+			readFileSync(join(options.bookDir, 'pages', BOOK_COVER_ASSET_PATH)),
+			{ compression: 'STORE' },
+		);
+	}
 	for (const figurePath of figurePaths) {
 		zip.file(`OEBPS/${figurePath}`, readFileSync(join(options.bookDir, 'pages', figurePath)), {
 			compression: 'STORE',

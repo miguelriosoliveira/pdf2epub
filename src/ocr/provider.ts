@@ -14,6 +14,8 @@ export interface RenderPageImageOptions {
 	outputPath: string;
 	dpi?: number;
 	crop?: NormalizedBBox;
+	/** Tighten a coarse crop to visible ink and add an equal pixel margin. */
+	trimWhitespace?: boolean;
 }
 
 export interface OcrProvider {

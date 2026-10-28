@@ -205,15 +205,15 @@ func writePng(cgImage: CGImage, to outputPath: String) throws {
 	}
 }
 
-func cropCGImage(_ image: CGImage, cropSpec: String) throws -> CGImage {
+func cropCGImage(_ image: CGImage, cropSpec: String, addPadding: Bool = true) throws -> CGImage {
 	let parts = cropSpec.split(separator: ",").compactMap { Double($0.trimmingCharacters(in: .whitespaces)) }
 	guard parts.count == 4 else {
 		throw HelperError.message("Invalid crop spec: \(cropSpec). Expected x,y,width,height")
 	}
 	let imgW = Double(image.width)
 	let imgH = Double(image.height)
-	let padY = 0.012
-	let padX = 0.01
+	let padY = addPadding ? 0.012 : 0.0
+	let padX = addPadding ? 0.01 : 0.0
 	let x = clamp01(parts[0] - padX) * imgW
 	let y = clamp01(parts[1] - padY) * imgH
 	let w = min(imgW - x, clamp01(parts[2] + padX * 2.0) * imgW)
@@ -224,6 +224,75 @@ func cropCGImage(_ image: CGImage, cropSpec: String) throws -> CGImage {
 		throw HelperError.message("Failed to crop CGImage with rect \(rect)")
 	}
 	return cropped
+}
+
+func trimWhitespaceAndPad(_ image: CGImage) -> CGImage {
+	let bytesPerPixel = 4
+	let bytesPerRow = image.width * bytesPerPixel
+	var pixels = [UInt8](repeating: 255, count: bytesPerRow * image.height)
+	let colorSpace = CGColorSpaceCreateDeviceRGB()
+	let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue
+
+	pixels.withUnsafeMutableBytes { rawBuffer in
+		guard
+			let data = rawBuffer.baseAddress,
+			let context = CGContext(
+				data: data,
+				width: image.width,
+				height: image.height,
+				bitsPerComponent: 8,
+				bytesPerRow: bytesPerRow,
+				space: colorSpace,
+				bitmapInfo: bitmapInfo
+			)
+		else {
+			return
+		}
+		context.setFillColor(red: 1, green: 1, blue: 1, alpha: 1)
+		context.fill(CGRect(x: 0, y: 0, width: image.width, height: image.height))
+		context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+	}
+
+	var minX = image.width
+	var minY = image.height
+	var maxX = -1
+	var maxY = -1
+	for y in 0..<image.height {
+		for x in 0..<image.width {
+			let pixelOffset = y * bytesPerRow + x * bytesPerPixel
+			let red = Double(pixels[pixelOffset])
+			let green = Double(pixels[pixelOffset + 1])
+			let blue = Double(pixels[pixelOffset + 2])
+			let luminance = (299 * red + 587 * green + 114 * blue) / 1000
+			if luminance < 245 {
+				minX = min(minX, x)
+				minY = min(minY, y)
+				maxX = max(maxX, x)
+				maxY = max(maxY, y)
+			}
+		}
+	}
+
+	guard maxX >= minX, maxY >= minY else {
+		return image
+	}
+
+	let contentWidth = maxX - minX + 1
+	let contentHeight = maxY - minY + 1
+	let targetPadding = max(4, Int((Double(max(contentWidth, contentHeight)) * 0.05).rounded()))
+	let availablePadding = min(minX, minY, image.width - maxX - 1, image.height - maxY - 1)
+	let padding = max(0, min(targetPadding, availablePadding))
+	let cropX = max(0, minX - padding)
+	let cropY = max(0, minY - padding)
+	let cropRight = min(image.width, maxX + padding + 1)
+	let cropBottom = min(image.height, maxY + padding + 1)
+	let rect = CGRect(
+		x: CGFloat(cropX),
+		y: CGFloat(cropY),
+		width: CGFloat(cropRight - cropX),
+		height: CGFloat(cropBottom - cropY)
+	)
+	return image.cropping(to: rect) ?? image
 }
 
 func run() throws {
@@ -239,6 +308,7 @@ func run() throws {
 	var dpiArg = 220.0
 	var outPath = ""
 	var cropArg = ""
+	var trimWhitespace = false
 
 	var i = 1
 	while i < args.count {
@@ -265,6 +335,8 @@ func run() throws {
 		case "--crop":
 			i += 1
 			if i < args.count { cropArg = args[i] }
+		case "--trim-whitespace":
+			trimWhitespace = true
 		default:
 			throw HelperError.message("Unknown argument: \(flag)")
 		}
@@ -320,7 +392,10 @@ func run() throws {
 			throw HelperError.message("Page \(pageArg) out of bounds (1..\(totalPages))")
 		}
 		let cgImage = try renderPdfPageToCGImage(page: pdfPage, dpi: dpiArg)
-		let finalImage = cropArg.isEmpty ? cgImage : try cropCGImage(cgImage, cropSpec: cropArg)
+		let croppedImage = cropArg.isEmpty
+			? cgImage
+			: try cropCGImage(cgImage, cropSpec: cropArg, addPadding: !trimWhitespace)
+		let finalImage = trimWhitespace ? trimWhitespaceAndPad(croppedImage) : croppedImage
 		try writePng(cgImage: finalImage, to: outPath)
 
 	default:

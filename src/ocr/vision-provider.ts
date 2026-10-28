@@ -123,6 +123,9 @@ export class VisionOcrProvider implements OcrProvider {
 		if (options.crop) {
 			args.push('--crop', formatBBox(options.crop));
 		}
+		if (options.trimWhitespace) {
+			args.push('--trim-whitespace');
+		}
 		await execFileAsync(bin, args, {
 			maxBuffer: 16 * 1024 * 1024,
 		});
