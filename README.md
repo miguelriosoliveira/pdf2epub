@@ -44,6 +44,8 @@ Scan a page range (or omit `--pages` to scan the entire book):
 pnpm start scan ./path/to/book.pdf -o ./books/my-book --pages 1-25 --title "Book Title" --author "Author Name"
 ```
 
+Layout detection defaults to `--profile auto`. Use `--profile technical` to favor code blocks, tables, comparison columns, and diagrams, or `--profile narrative` for prose-first reconstruction.
+
 This creates:
 - `./books/my-book/book.json` — Book metadata, OCR settings, and review statistics.
 - `./books/my-book/pages/page-0001.md` ... `page-0025.md` — One human-editable Markdown file per PDF page.
@@ -94,7 +96,7 @@ pnpm start build ./books/my-book -o ./books/my-book/my-book.epub
 
 | Command | Description | Key Options |
 | --- | --- | --- |
-| `pnpm start scan <pdf> -o <dir>` | Run OCR + local NLP scoring and write `pages/page-NNNN.md` | `--pages <range>`, `--threshold <0..1>`, `--dpi <num>`, `--engine <macos-vision\|tesseract>`, `--title`, `--author`, `--auto-llm`, `--max-llm-blocks <n>` |
+| `pnpm start scan <pdf> -o <dir>` | Run OCR + layout-aware NLP scoring and write `pages/page-NNNN.md` | `--pages <range>`, `--profile <auto\|narrative\|technical>`, `--threshold <0..1>`, `--dpi <num>`, `--engine <macos-vision\|tesseract>`, `--title`, `--author`, `--auto-llm`, `--max-llm-blocks <n>` |
 | `pnpm start status <bookDir>` | Show summary of clean, reviewed, and `needs-review` pages | — |
 | `pnpm start fix-flagged <bookDir>` | Crop flagged bounding boxes and repair via multimodal LLM | `--dry-run`, `--page <n>`, `--max-blocks <n>`, `--model <name>` |
 | `pnpm start review <bookDir>` | Launch local side-by-side PDF + Markdown review web UI | `-p, --port <port>` (default `4321`) |

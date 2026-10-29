@@ -12,7 +12,7 @@ import { isTocEntryLine, TOC_ENTRY_LINE_REGEX } from '../nlp/layout-reconstructo
 import type { BookManifest, PageDocument } from '../types/domain.ts';
 
 export interface EpubParagraphItem {
-	kind: 'heading' | 'paragraph' | 'figure';
+	kind: 'heading' | 'paragraph' | 'code' | 'table' | 'figure';
 	text: string;
 	sourcePages: number[];
 }
@@ -183,6 +183,50 @@ function renderParagraphOrTocXhtml(text: string): string {
 	return `\t\t<p>${escapeXml(text)}</p>`;
 }
 
+function renderTableXhtml(markdown: string): string {
+	const comparisonTable = markdown.match(
+		/^<table>\s*<thead><tr><th>([^<]*)<\/th><th>([^<]*)<\/th><\/tr><\/thead>\s*<tbody><tr>\s*<td><pre><code>([\s\S]*?)<\/code><\/pre><\/td>\s*<td><pre><code>([\s\S]*?)<\/code><\/pre><\/td>\s*<\/tr><\/tbody>\s*<\/table>$/,
+	);
+	if (comparisonTable?.slice(1).every(value => value !== undefined && !/[<>]/.test(value))) {
+		return `\t\t${markdown.trim().replace(/\n/g, '\n\t\t')}`;
+	}
+
+	const rows = markdown
+		.split(/\r?\n/)
+		.map(line => line.trim())
+		.filter(line => line.startsWith('|') && line.endsWith('|'))
+		.map(line =>
+			line
+				.slice(1, -1)
+				.split('|')
+				.map(cell => cell.trim()),
+		);
+	if (rows.length < 2) {
+		return `\t\t<p>${escapeXml(markdown)}</p>`;
+	}
+
+	const renderCell = (cell: string) =>
+		cell
+			.split(/<br\s*\/?\s*>/i)
+			.map(value => {
+				const code = value.match(/^`([^`]*)`$/);
+				return code?.[1] !== undefined ? `<code>${escapeXml(code[1])}</code>` : escapeXml(value);
+			})
+			.join('<br />');
+	const headerCells = rows[0] ?? [];
+	const bodyRows = rows.slice(2);
+	return [
+		'\t\t<table>',
+		`\t\t\t<thead><tr>${headerCells.map(cell => `<th>${renderCell(cell)}</th>`).join('')}</tr></thead>`,
+		'\t\t\t<tbody>',
+		...bodyRows.map(
+			row => `\t\t\t\t<tr>${row.map(cell => `<td>${renderCell(cell)}</td>`).join('')}</tr>`,
+		),
+		'\t\t\t</tbody>',
+		'\t\t</table>',
+	].join('\n');
+}
+
 function renderChapterXhtml(chapter: EpubChapter, language: string): string {
 	const bodyHtml = chapter.items
 		.map(item => {
@@ -191,6 +235,12 @@ function renderChapterXhtml(chapter: EpubChapter, language: string): string {
 			}
 			if (item.kind === 'figure') {
 				return renderFigureXhtml(item.text);
+			}
+			if (item.kind === 'code') {
+				return `\t\t<pre><code>${escapeXml(item.text)}</code></pre>`;
+			}
+			if (item.kind === 'table') {
+				return renderTableXhtml(item.text);
 			}
 			return renderParagraphOrTocXhtml(item.text);
 		})

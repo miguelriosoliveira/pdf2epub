@@ -3,8 +3,12 @@ import { z } from 'zod';
 export const PAGE_STATUSES = ['clean', 'needs-review', 'reviewed', 'llm-fixed'] as const;
 export type PageStatus = (typeof PAGE_STATUSES)[number];
 
-export const BLOCK_KINDS = ['heading', 'paragraph'] as const;
+export const BLOCK_KINDS = ['heading', 'paragraph', 'code', 'table'] as const;
 export type BlockKind = (typeof BLOCK_KINDS)[number];
+
+export const LAYOUT_PROFILES = ['auto', 'narrative', 'technical'] as const;
+export type LayoutProfile = (typeof LAYOUT_PROFILES)[number];
+export const LayoutProfileSchema = z.enum(LAYOUT_PROFILES);
 
 export const OCR_ENGINES = ['macos-vision', 'tesseract'] as const;
 export type OcrEngine = (typeof OCR_ENGINES)[number];
@@ -91,6 +95,7 @@ export const BookManifestSchema = z.object({
 	scannedPages: z.array(z.number().int().positive()),
 	threshold: z.number().min(0).max(1),
 	ocrEngine: z.enum(OCR_ENGINES),
+	layoutProfile: LayoutProfileSchema.optional(),
 	createdAt: z.string(),
 	updatedAt: z.string(),
 	stats: BookStatsSchema,

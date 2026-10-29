@@ -7,7 +7,7 @@ import {
 } from '../nlp/figure-detector.ts';
 import { processOcrPagesToDocuments } from '../nlp/index.ts';
 import type { OcrProvider } from '../ocr/provider.ts';
-import type { OcrPageResult, PageDocument } from '../types/domain.ts';
+import type { LayoutProfile, OcrPageResult, PageDocument } from '../types/domain.ts';
 
 export async function writeOcrPagesToWorkspace(options: {
 	bookDir: string;
@@ -16,11 +16,12 @@ export async function writeOcrPagesToWorkspace(options: {
 	provider: OcrProvider;
 	dpi?: number;
 	threshold?: number;
+	profile?: LayoutProfile;
 }): Promise<PageDocument[]> {
-	const documents = processOcrPagesToDocuments(
-		options.pages,
-		options.threshold === undefined ? {} : { threshold: options.threshold },
-	);
+	const documents = processOcrPagesToDocuments(options.pages, {
+		...(options.threshold === undefined ? {} : { threshold: options.threshold }),
+		...(options.profile === undefined ? {} : { profile: options.profile }),
+	});
 
 	for (const document of documents) {
 		if (document.frontmatter.page === 1) {

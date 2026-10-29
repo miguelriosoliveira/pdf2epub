@@ -416,6 +416,263 @@ describe('OCR asymptotic-notation recovery', () => {
 	});
 });
 
+describe('technical layout reconstruction', () => {
+	it('keeps code snippets and side-by-side code comparisons structured', () => {
+		const page: OcrPageResult = {
+			page: 53,
+			widthPx: 1600,
+			heightPx: 2200,
+			lines: [
+				{
+					text: 'int pairSumSequence(int n) { /* Ex 2.*/',
+					confidence: 1,
+					bbox: { x: 0.122, y: 0.107, width: 0.373, height: 0.013 },
+				},
+				{ text: '2', confidence: 1, bbox: { x: 0.09, y: 0.124, width: 0.011, height: 0.009 } },
+				{
+					text: 'int sum = 0;',
+					confidence: 1,
+					bbox: { x: 0.146, y: 0.124, width: 0.116, height: 0.01 },
+				},
+				{ text: '3', confidence: 1, bbox: { x: 0.09, y: 0.138, width: 0.011, height: 0.009 } },
+				{
+					text: 'for (int i = 0; i < n; i++) {',
+					confidence: 1,
+					bbox: { x: 0.141, y: 0.136, width: 0.281, height: 0.012 },
+				},
+				{
+					text: 'sum += pairSum(i, i + 1);',
+					confidence: 1,
+					bbox: { x: 0.171, y: 0.15, width: 0.236, height: 0.015 },
+				},
+				{ text: '}', confidence: 1, bbox: { x: 0.146, y: 0.166, width: 0.013, height: 0.013 } },
+				{
+					text: 'return sum;',
+					confidence: 1,
+					bbox: { x: 0.147, y: 0.181, width: 0.105, height: 0.012 },
+				},
+				{ text: '7 }', confidence: 1, bbox: { x: 0.09, y: 0.196, width: 0.045, height: 0.012 } },
+				{ text: '8', confidence: 1, bbox: { x: 0.09, y: 0.211, width: 0.011, height: 0.01 } },
+				{
+					text: 'int pairSum(int a, int b) {',
+					confidence: 1,
+					bbox: { x: 0.124, y: 0.225, width: 0.255, height: 0.012 },
+				},
+				{
+					text: '10 return a + b;',
+					confidence: 1,
+					bbox: { x: 0.146, y: 0.24, width: 0.124, height: 0.012 },
+				},
+				{ text: '11 }', confidence: 1, bbox: { x: 0.09, y: 0.254, width: 0.045, height: 0.012 } },
+				{
+					text: 'Consider the below code:',
+					confidence: 1,
+					bbox: { x: 0.09, y: 0.493, width: 0.199, height: 0.012 },
+				},
+				{
+					text: 'Min and Max 1',
+					confidence: 1,
+					bbox: { x: 0.171, y: 0.522, width: 0.122, height: 0.013 },
+				},
+				{
+					text: 'Min and Max 2',
+					confidence: 1,
+					bbox: { x: 0.501, y: 0.522, width: 0.124, height: 0.012 },
+				},
+				{
+					text: 'int min = Integer.MAX_VALUE;',
+					confidence: 1,
+					bbox: { x: 0.197, y: 0.542, width: 0.274, height: 0.013 },
+				},
+				{
+					text: '1 int min = Integer.MAX_VALUE;',
+					confidence: 1,
+					bbox: { x: 0.503, y: 0.542, width: 0.3, height: 0.013 },
+				},
+				{
+					text: 'int max = Integer.MIN_VALUE;',
+					confidence: 1,
+					bbox: { x: 0.208, y: 0.557, width: 0.266, height: 0.013 },
+				},
+				{
+					text: '2 int max = Integer.MIN_VALUE;',
+					confidence: 1,
+					bbox: { x: 0.537, y: 0.557, width: 0.266, height: 0.015 },
+				},
+				{
+					text: 'for (int x : array) {',
+					confidence: 1,
+					bbox: { x: 0.208, y: 0.571, width: 0.199, height: 0.013 },
+				},
+				{
+					text: '3 for (int x : array) {',
+					confidence: 1,
+					bbox: { x: 0.503, y: 0.571, width: 0.238, height: 0.013 },
+				},
+				{
+					text: 'if (x < min) min = x;',
+					confidence: 1,
+					bbox: { x: 0.229, y: 0.586, width: 0.199, height: 0.013 },
+				},
+				{
+					text: '4 if (x < min) min = x;',
+					confidence: 1,
+					bbox: { x: 0.503, y: 0.587, width: 0.203, height: 0.013 },
+				},
+				{
+					text: 'if (x > max) max = x;',
+					confidence: 1,
+					bbox: { x: 0.229, y: 0.6, width: 0.199, height: 0.013 },
+				},
+				{ text: '}', confidence: 1, bbox: { x: 0.537, y: 0.615, width: 0.013, height: 0.013 } },
+				{
+					text: 'for (int x : array) {',
+					confidence: 1,
+					bbox: { x: 0.537, y: 0.615, width: 0.201, height: 0.013 },
+				},
+				{
+					text: 'if (x > max) max = x;',
+					confidence: 1,
+					bbox: { x: 0.561, y: 0.631, width: 0.199, height: 0.013 },
+				},
+				{ text: '}', confidence: 1, bbox: { x: 0.533, y: 0.645, width: 0.017, height: 0.013 } },
+				{
+					text: 'Which one is faster?',
+					confidence: 1,
+					bbox: { x: 0.086, y: 0.669, width: 0.3, height: 0.015 },
+				},
+			],
+		};
+
+		const document = processOcrPagesToDocuments([page])[0];
+		const markdown = document ? serializePageDocument(document) : '';
+		const parsed = parsePageDocument(markdown);
+
+		expect(markdown).toContain('```');
+		expect(markdown).toContain('int pairSumSequence(int n)');
+		expect(markdown).toContain('return a + b;\n}');
+		expect(markdown).not.toContain('11 }');
+		expect(markdown).toContain('<table>');
+		expect(markdown).toContain('<td><pre><code>');
+		expect(markdown).not.toContain('\n\n8\n\n');
+		expect(parsed.blocks.some(block => block.kind === 'code')).toBe(true);
+		expect(parsed.blocks.some(block => block.kind === 'table')).toBe(true);
+
+		const narrative = processOcrPagesToDocuments([page], { profile: 'narrative' })[0];
+		expect(narrative?.blocks.some(block => block.kind === 'code')).toBe(false);
+		expect(narrative?.blocks.some(block => block.text.startsWith('![Figure'))).toBe(false);
+		const technical = processOcrPagesToDocuments([page], { profile: 'technical' })[0];
+		expect(technical?.blocks.some(block => block.kind === 'code')).toBe(true);
+		expect(markdown).toContain('  int sum = 0;');
+		expect(markdown).toContain('    sum += pairSum(i, i + 1);');
+		expect(markdown).toContain('<pre><code>');
+		expect(markdown).toContain('<th>Min and Max 1</th><th>Min and Max 2</th>');
+		expect(markdown).not.toContain('<br>');
+	});
+
+	it('preserves a recursion tree as a figure and its neighboring grid as a table', () => {
+		const page: OcrPageResult = {
+			page: 57,
+			widthPx: 1600,
+			heightPx: 2200,
+			lines: [
+				{
+					text: 'if (n <= 1) {',
+					confidence: 1,
+					bbox: { x: 0.148, y: 0.074, width: 0.126, height: 0.013 },
+				},
+				{
+					text: 'return 1;',
+					confidence: 1,
+					bbox: { x: 0.173, y: 0.088, width: 0.086, height: 0.014 },
+				},
+				{
+					text: 'return f(n - 1) + f(n - 1);',
+					confidence: 1,
+					bbox: { x: 0.15, y: 0.118, width: 0.255, height: 0.013 },
+				},
+				{ text: '}', confidence: 1, bbox: { x: 0.126, y: 0.132, width: 0.011, height: 0.012 } },
+				{
+					text: 'Suppose we call f (4). This calls f (3) twice and then f (2).',
+					confidence: 1,
+					bbox: { x: 0.09, y: 0.192, width: 0.73, height: 0.019 },
+				},
+				{ text: 'f (4)', confidence: 1, bbox: { x: 0.473, y: 0.216, width: 0.047, height: 0.016 } },
+				{ text: 'f (3)', confidence: 1, bbox: { x: 0.287, y: 0.243, width: 0.045, height: 0.013 } },
+				{ text: 'f (3)', confidence: 1, bbox: { x: 0.66, y: 0.244, width: 0.043, height: 0.013 } },
+				{ text: 'f (1)', confidence: 1, bbox: { x: 0.165, y: 0.294, width: 0.034, height: 0.012 } },
+				{ text: 'f (1)', confidence: 1, bbox: { x: 0.242, y: 0.294, width: 0.036, height: 0.012 } },
+				{ text: 'f (1)', confidence: 1, bbox: { x: 0.426, y: 0.295, width: 0.047, height: 0.013 } },
+				{ text: 'f (1)', confidence: 1, bbox: { x: 0.516, y: 0.292, width: 0.051, height: 0.016 } },
+				{ text: 'f (1)', confidence: 1, bbox: { x: 0.61, y: 0.291, width: 0.047, height: 0.016 } },
+				{ text: 'f (1)', confidence: 1, bbox: { x: 0.708, y: 0.292, width: 0.045, height: 0.016 } },
+				{ text: 'f (1)', confidence: 1, bbox: { x: 0.782, y: 0.292, width: 0.047, height: 0.016 } },
+				{
+					text: 'How many calls are in this tree? (Don’t count!)',
+					confidence: 1,
+					bbox: { x: 0.092, y: 0.331, width: 0.351, height: 0.013 },
+				},
+				{
+					text: 'The number of nodes on each level is:',
+					confidence: 1,
+					bbox: { x: 0.092, y: 0.374, width: 0.593, height: 0.013 },
+				},
+				{ text: 'Level', confidence: 1, bbox: { x: 0.218, y: 0.4, width: 0.034, height: 0.012 } },
+				{ text: '# Nodes', confidence: 1, bbox: { x: 0.268, y: 0.4, width: 0.069, height: 0.012 } },
+				{
+					text: 'Also expressed as...',
+					confidence: 1,
+					bbox: { x: 0.358, y: 0.4, width: 0.152, height: 0.013 },
+				},
+				{ text: 'Or...', confidence: 1, bbox: { x: 0.694, y: 0.4, width: 0.036, height: 0.013 } },
+				{ text: '2^0', confidence: 1, bbox: { x: 0.694, y: 0.419, width: 0.024, height: 0.013 } },
+				{ text: '2', confidence: 1, bbox: { x: 0.27, y: 0.44, width: 0.013, height: 0.01 } },
+				{
+					text: '2 * previous level = 2',
+					confidence: 1,
+					bbox: { x: 0.358, y: 0.44, width: 0.163, height: 0.012 },
+				},
+				{ text: '2^1', confidence: 1, bbox: { x: 0.694, y: 0.439, width: 0.026, height: 0.015 } },
+				{ text: '2', confidence: 1, bbox: { x: 0.21, y: 0.461, width: 0.013, height: 0.012 } },
+				{ text: '4', confidence: 1, bbox: { x: 0.268, y: 0.462, width: 0.015, height: 0.012 } },
+				{
+					text: '2 * previous level = 2 * 2^1 = 2^2',
+					confidence: 1,
+					bbox: { x: 0.355, y: 0.459, width: 0.266, height: 0.018 },
+				},
+				{ text: '2^2', confidence: 1, bbox: { x: 0.694, y: 0.459, width: 0.026, height: 0.015 } },
+				{ text: '8', confidence: 1, bbox: { x: 0.27, y: 0.483, width: 0.013, height: 0.01 } },
+				{
+					text: '2 * previous level = 2 * 2^2 = 2^3',
+					confidence: 1,
+					bbox: { x: 0.355, y: 0.48, width: 0.266, height: 0.018 },
+				},
+				{ text: '2^3', confidence: 1, bbox: { x: 0.694, y: 0.481, width: 0.024, height: 0.015 } },
+				{ text: '16', confidence: 1, bbox: { x: 0.268, y: 0.503, width: 0.024, height: 0.013 } },
+				{
+					text: '2 * previous level = 2 * 2^3 = 2^4',
+					confidence: 1,
+					bbox: { x: 0.355, y: 0.5, width: 0.266, height: 0.017 },
+				},
+				{ text: '2^4', confidence: 1, bbox: { x: 0.694, y: 0.503, width: 0.024, height: 0.013 } },
+			],
+		};
+
+		const document = processOcrPagesToDocuments([page])[0];
+		const markdown = document ? serializePageDocument(document) : '';
+
+		expect(markdown).toContain('![Figure from page 57](figures/page-0057-figure-01.png)');
+		expect(markdown).toContain('| Level | # Nodes | Also expressed as... | Or... |');
+		expect(markdown).toContain('| 4 | 2 * previous level = 2 * 2^1 = 2^2 |');
+		expect(markdown).toContain('Suppose we call f (4). This calls f (3) twice');
+		expect(markdown).not.toContain('\n\nf (3)\n\n');
+		expect(markdown).not.toContain('\n\n+(2)\n\n');
+		expect(markdown).not.toContain('\n\n(2)\n\n');
+		const parsed = parsePageDocument(markdown);
+		expect(parsed.blocks.some(block => block.kind === 'table')).toBe(true);
+	});
+});
+
 describe('scan output with detected figures', () => {
 	it('writes the figure crop asset referenced by the page Markdown', async () => {
 		const bookDir = createTempDir();
@@ -608,6 +865,55 @@ describe('Markdown round-trip serialization & LLM cost estimation', () => {
 		const estimate = estimateLlmRepairCost(candidates, 10);
 		expect(estimate.selectedBlocks).toBe(1);
 		expect(estimate.estimatedInputTokens).toBeGreaterThan(250);
+	});
+
+	it('round-trips technical code blocks with blank lines and Markdown tables', () => {
+		const page: PageDocument = {
+			frontmatter: {
+				page: 44,
+				status: 'clean',
+				confidence: 1,
+				flaggedBlocks: 0,
+				continuesFromPrev: false,
+				continuesToNext: false,
+			},
+			blocks: [
+				{
+					id: 'p44-code-1',
+					kind: 'code',
+					text: 'int value = 1;\n\nreturn value;',
+					bbox: { x: 0.1, y: 0.1, width: 0.5, height: 0.1 },
+					confidence: {
+						composite: 1,
+						ocr: 1,
+						dictionary: 1,
+						garble: 1,
+						flagged: false,
+						reasons: [],
+					},
+				},
+				{
+					id: 'p44-table-1',
+					kind: 'table',
+					text: '| A | B |\n| --- | --- |\n| 1 | 2 |',
+					bbox: { x: 0.1, y: 0.3, width: 0.8, height: 0.1 },
+					confidence: {
+						composite: 1,
+						ocr: 1,
+						dictionary: 1,
+						garble: 1,
+						flagged: false,
+						reasons: [],
+					},
+				},
+			],
+		};
+
+		const markdown = serializePageDocument(page);
+		const parsed = parsePageDocument(markdown);
+		expect(parsed.blocks.map(block => block.kind)).toEqual(['code', 'table']);
+		expect(parsed.blocks[0]?.text).toBe('int value = 1;\n\nreturn value;');
+		expect(parsed.blocks[1]?.text).toBe('| A | B |\n| --- | --- |\n| 1 | 2 |');
 	});
 });
 
@@ -936,6 +1242,34 @@ describe('EPUB 3 stitching and archive builder', () => {
 					},
 				},
 				{
+					id: 'p2-code-1',
+					kind: 'code',
+					text: 'const n = 1;',
+					bbox: { x: 0.1, y: 0.16, width: 0.3, height: 0.04 },
+					confidence: {
+						composite: 1,
+						ocr: 1,
+						dictionary: 1,
+						garble: 1,
+						flagged: false,
+						reasons: [],
+					},
+				},
+				{
+					id: 'p2-table-1',
+					kind: 'table',
+					text: '<table>\n<thead><tr><th>Min and Max 1</th><th>Min and Max 2</th></tr></thead>\n<tbody><tr>\n<td><pre><code>if (x &lt; min) min = x;\n  return value;</code></pre></td>\n<td><pre><code>int max = 0;</code></pre></td>\n</tr></tbody>\n</table>',
+					bbox: { x: 0.1, y: 0.21, width: 0.5, height: 0.08 },
+					confidence: {
+						composite: 1,
+						ocr: 1,
+						dictionary: 1,
+						garble: 1,
+						flagged: false,
+						reasons: [],
+					},
+				},
+				{
 					id: 'p2-figure-1',
 					kind: 'paragraph',
 					text: `![Figure from page 51](${imagePath})`,
@@ -984,6 +1318,10 @@ describe('EPUB 3 stitching and archive builder', () => {
 		expect(chapter).toContain(
 			'<img src="figures/page-0051-figure-01.png" alt="Figure from page 51" />',
 		);
+		expect(chapter).toContain('<pre><code>const n = 1;</code></pre>');
+		expect(chapter).toContain('<table>');
+		expect(chapter).toContain('<td><pre><code>if (x &lt; min) min = x;');
+		expect(chapter).toContain('return value;</code></pre></td>');
 		expect(packageXml).toContain(
 			'href="images/cover.png" media-type="image/png" properties="cover-image"',
 		);

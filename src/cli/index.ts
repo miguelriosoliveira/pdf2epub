@@ -15,7 +15,7 @@ import {
 } from '../markdown/page-serializer.ts';
 import { createOcrProvider } from '../ocr/index.ts';
 import { writeOcrPagesToWorkspace } from '../pipeline/scan-writer.ts';
-import type { BookManifest, OcrEngine } from '../types/domain.ts';
+import { type BookManifest, LayoutProfileSchema, type OcrEngine } from '../types/domain.ts';
 import { startReviewServer } from '../web/server.ts';
 
 export function parsePagesOption(raw?: string): number[] | 'all' {
@@ -80,6 +80,7 @@ export function createCliProgram(): Command {
 		.option('--threshold <score>', 'Confidence score threshold [0..1]', '0.82')
 		.option('--dpi <dpi>', 'Render DPI for OCR', '220')
 		.option('--engine <engine>', 'Force OCR engine (macos-vision | tesseract)')
+		.option('--profile <profile>', 'Layout profile (auto | narrative | technical)', 'auto')
 		.option('--title <title>', 'Book title override')
 		.option('--author <author>', 'Book author override')
 		.option('--auto-llm', 'Automatically repair flagged blocks via LLM after scanning', false)
@@ -91,6 +92,7 @@ export function createCliProgram(): Command {
 			const threshold = Number.parseFloat(String(opts.threshold ?? '0.82'));
 			const dpi = Number.parseInt(String(opts.dpi ?? '220'), 10);
 			const lang = String(opts.lang ?? 'en');
+			const layoutProfile = LayoutProfileSchema.parse(opts.profile ?? 'auto');
 			const preferredEngine =
 				opts.engine === 'tesseract' || opts.engine === 'macos-vision'
 					? (opts.engine satisfies OcrEngine)
@@ -119,6 +121,7 @@ export function createCliProgram(): Command {
 				provider,
 				dpi,
 				threshold,
+				profile: layoutProfile,
 			});
 
 			const allDocs = loadAllPageDocuments(outDir);
@@ -135,6 +138,7 @@ export function createCliProgram(): Command {
 				scannedPages: allDocs.map(d => d.frontmatter.page),
 				threshold,
 				ocrEngine: provider.engine,
+				layoutProfile,
 				createdAt: now,
 				updatedAt: now,
 				stats,

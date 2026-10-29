@@ -1,25 +1,33 @@
-import type { OcrPageResult, PageDocument, PageStatus } from '../types/domain.ts';
+import type { LayoutProfile, OcrPageResult, PageDocument, PageStatus } from '../types/domain.ts';
 import { buildBookVocabulary, scorePageBlocks } from './confidence-scorer.ts';
 import { detectGraphFigureRegions, figureAssetPath } from './figure-detector.ts';
 import { detectRepeatingMarginKeys, reconstructPageLayout } from './layout-reconstructor.ts';
 import { normalizeAsymptoticNotation } from './math-normalizer.ts';
+import { extractTechnicalRegions } from './technical-layout.ts';
 
 export function processOcrPagesToDocuments(
 	pages: readonly OcrPageResult[],
 	options: {
 		threshold?: number;
+		profile?: LayoutProfile;
 	} = {},
 ): PageDocument[] {
 	const threshold = options.threshold ?? 0.82;
+	const profile = options.profile ?? 'auto';
 	const repeatingMarginKeys = detectRepeatingMarginKeys(pages);
 	const bookVocab = buildBookVocabulary(pages);
 
 	return pages.map(ocrPage => {
-		const figureRegions = detectGraphFigureRegions(ocrPage.lines);
+		const technical = profile === 'narrative' ? null : extractTechnicalRegions(ocrPage, profile);
+		const figureRegions = [
+			...(profile === 'narrative' ? [] : detectGraphFigureRegions(ocrPage.lines)),
+			...(technical?.figureRegions ?? []),
+		];
 		const figureLabelLines = new Set(figureRegions.flatMap(region => region.labelLines));
+		const consumedLines = new Set([...figureLabelLines, ...(technical?.consumedLines ?? [])]);
 		const layoutPage = {
 			...ocrPage,
-			lines: ocrPage.lines.filter(line => !figureLabelLines.has(line)),
+			lines: ocrPage.lines.filter(line => !consumedLines.has(line)),
 		};
 		const layout = reconstructPageLayout(layoutPage, repeatingMarginKeys);
 		const normalizedLayoutBlocks = layout.blocks.map(block => ({
@@ -27,6 +35,11 @@ export function processOcrPagesToDocuments(
 			text: normalizeAsymptoticNotation(block.text),
 		}));
 		const textBlocks = scorePageBlocks(normalizedLayoutBlocks, { threshold, bookVocab });
+		const normalizedTechnicalBlocks = (technical?.blocks ?? []).map(block => ({
+			...block,
+			text: normalizeAsymptoticNotation(block.text),
+		}));
+		const technicalBlocks = scorePageBlocks(normalizedTechnicalBlocks, { threshold, bookVocab });
 		const figureBlocks = figureRegions.map((region, index) => ({
 			id: `p${ocrPage.page}-figure-${index + 1}`,
 			kind: 'paragraph' as const,
@@ -41,7 +54,9 @@ export function processOcrPagesToDocuments(
 				reasons: [],
 			},
 		}));
-		const blocks = [...textBlocks, ...figureBlocks].sort((a, b) => a.bbox.y - b.bbox.y);
+		const blocks = [...textBlocks, ...technicalBlocks, ...figureBlocks].sort(
+			(a, b) => a.bbox.y - b.bbox.y,
+		);
 
 		const flaggedBlocks = blocks.filter(b => b.confidence.flagged).length;
 		const minBlockConfidence =
@@ -66,3 +81,4 @@ export * from './confidence-scorer.ts';
 export * from './figure-detector.ts';
 export * from './layout-reconstructor.ts';
 export * from './math-normalizer.ts';
+export * from './technical-layout.ts';

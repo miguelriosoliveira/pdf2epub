@@ -234,10 +234,11 @@ export function scoreBlockConfidence(
 	const threshold = options.threshold ?? 0.82;
 	const bookVocab = options.bookVocab ?? new Set<string>();
 	const spell = getSpellChecker();
+	const isStructuredBlock = block.kind === 'code' || block.kind === 'table';
 
 	const ocrScore = computeOcrLineScore(block.lines);
 
-	const words = extractWords(block.text);
+	const words = isStructuredBlock ? [] : extractWords(block.text);
 	const oovWords: string[] = [];
 	for (const word of words) {
 		if (!isWordLexicallyValid(word, spell, bookVocab)) {
@@ -249,7 +250,9 @@ export function scoreBlockConfidence(
 	const oovRatio = oovWords.length / effectiveWordCount;
 	const dictScore = clamp01(1 - oovRatio * 1.6);
 
-	const garble = analyzeGarbleHeuristics(block.text);
+	const garble = isStructuredBlock
+		? { score: 1, anomalyCount: 0 }
+		: analyzeGarbleHeuristics(block.text);
 	const composite = clamp01(0.45 * ocrScore + 0.3 * dictScore + 0.25 * garble.score);
 
 	const reasons: string[] = [];

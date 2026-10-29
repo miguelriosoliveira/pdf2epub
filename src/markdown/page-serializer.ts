@@ -26,7 +26,13 @@ function escapeAttrValue(value: string): string {
 }
 
 function renderBlockMarkdown(block: TextBlock): string {
-	const content = block.kind === 'heading' ? `# ${block.text.trim()}` : block.text.trim();
+	const trimmed = block.text.trim();
+	const content =
+		block.kind === 'heading'
+			? `# ${trimmed}`
+			: block.kind === 'code'
+				? `\`\`\`\n${trimmed}\n\`\`\``
+				: trimmed;
 	if (!block.confidence.flagged) {
 		return content;
 	}
@@ -73,13 +79,21 @@ function parseTextContentToBlock(
 	attrs?: Record<string, string>,
 ): TextBlock {
 	const trimmed = rawContent.trim();
-	const isHeading = /^#{1,3}\s+/.test(trimmed);
-	const text = isHeading ? trimmed.replace(/^#{1,3}\s+/, '').trim() : trimmed;
+	const codeMatch = trimmed.match(/^(`{3,})[^\r\n]*\r?\n([\s\S]*?)\r?\n\1$/);
+	const isCode = codeMatch?.[2] !== undefined;
+	const isTable = !isCode && isMarkdownTable(trimmed);
+	const isHeading = !isCode && !isTable && /^#{1,3}\s+/.test(trimmed);
+	const kind = isCode ? 'code' : isTable ? 'table' : isHeading ? 'heading' : 'paragraph';
+	const text = isCode
+		? (codeMatch?.[2] ?? '')
+		: isHeading
+			? trimmed.replace(/^#{1,3}\s+/, '').trim()
+			: trimmed;
 
 	if (!attrs) {
 		return {
 			id: fallbackId,
-			kind: isHeading ? 'heading' : 'paragraph',
+			kind,
 			text,
 			bbox: { x: 0, y: 0, width: 1, height: 0.05 },
 			confidence: {
@@ -105,7 +119,7 @@ function parseTextContentToBlock(
 
 	return {
 		id: attrs.id || fallbackId,
-		kind: isHeading ? 'heading' : 'paragraph',
+		kind,
 		text,
 		bbox,
 		confidence: {
@@ -117,6 +131,18 @@ function parseTextContentToBlock(
 			reasons,
 		},
 	};
+}
+
+function isMarkdownTable(markdown: string): boolean {
+	const lines = markdown.split(/\r?\n/).map(line => line.trim());
+	if (lines[0] === '<table>' && lines[lines.length - 1] === '</table>') {
+		return true;
+	}
+	return (
+		lines.length >= 2 &&
+		/^\|.*\|$/.test(lines[0] ?? '') &&
+		/^\|(?:\s*:?-{3,}:?\s*\|)+$/.test(lines[1] ?? '')
+	);
 }
 
 export function parsePageDocument(markdown: string): PageDocument {
@@ -167,6 +193,25 @@ export function parsePageDocument(markdown: string): PageDocument {
 				);
 				blockCounter += 1;
 			}
+			continue;
+		}
+
+		const codeFence = currentLine.match(/^(`{3,})/);
+		if (codeFence?.[1]) {
+			const codeLines = [lines[index] ?? ''];
+			index += 1;
+			while (index < lines.length) {
+				const candidate = lines[index] ?? '';
+				codeLines.push(candidate);
+				index += 1;
+				if (candidate.trim() === codeFence[1]) {
+					break;
+				}
+			}
+			blocks.push(
+				parseTextContentToBlock(codeLines.join('\n'), `p${frontmatter.page}-b${blockCounter}`),
+			);
+			blockCounter += 1;
 			continue;
 		}
 
