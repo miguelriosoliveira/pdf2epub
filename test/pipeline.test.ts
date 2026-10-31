@@ -2,14 +2,21 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { createServer as createTcpServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { createContext, runInContext } from 'node:vm';
 import { inflateSync } from 'node:zlib';
 import JSZip from 'jszip';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { parsePagesOption } from '../src/cli/index.ts';
 import { buildEpubFromWorkspace, stitchPagesAndGroupChapters } from '../src/epub/builder.ts';
-import { collectFlaggedCandidates, estimateLlmRepairCost } from '../src/llm/repair.ts';
+import {
+	collectFlaggedCandidates,
+	estimateLlmRepairCost,
+	repairFlaggedBlocks,
+} from '../src/llm/repair.ts';
 import {
 	parsePageDocument,
+	readBookManifest,
+	readPageFile,
 	serializePageDocument,
 	writeBookManifest,
 	writePageFile,
@@ -23,7 +30,9 @@ import {
 	reconstructPageLayout,
 	scoreBlockConfidence,
 } from '../src/nlp/index.ts';
+import { LocalTesseractAlternative } from '../src/ocr/alternative-ocr.ts';
 import type { OcrProvider, RenderPageImageOptions } from '../src/ocr/provider.ts';
+import { TesseractOcrProvider } from '../src/ocr/tesseract-provider.ts';
 import { VisionOcrProvider } from '../src/ocr/vision-provider.ts';
 import { writeOcrPagesToWorkspace } from '../src/pipeline/scan-writer.ts';
 import type { OcrPageResult, PageDocument } from '../src/types/domain.ts';
@@ -148,6 +157,130 @@ afterEach(() => {
 });
 
 describe('layout reconstruction & header/footer stripping', () => {
+	it('stores repeated running headers, footers and printed page numbers as page metadata', () => {
+		const pages: OcrPageResult[] = [51, 52].map((page, index) => ({
+			page,
+			widthPx: 1600,
+			heightPx: 2200,
+			lines: [
+				{
+					text: index === 0 ? 'VI | Big O' : 'Vl Big O',
+					confidence: 1,
+					bbox: { x: 0.8, y: 0.03, width: 0.1, height: 0.015 },
+				},
+				{
+					text: 'The chapter discussion continues here.',
+					confidence: 1,
+					bbox: { x: 0.1, y: 0.1, width: 0.7, height: 0.02 },
+				},
+				{
+					text:
+						index === 0
+							? 'CrackingTheCodingInterview.com | 6th Edition'
+							: 'CrackingTheCodinglnterview.com | 6th Edition',
+					confidence: 1,
+					bbox: { x: 0.5, y: 0.94, width: 0.32, height: 0.015 },
+				},
+				{
+					text: String(39 + index),
+					confidence: 1,
+					bbox: { x: 0.86, y: 0.94, width: 0.03, height: 0.015 },
+				},
+			],
+		}));
+
+		const docs = processOcrPagesToDocuments(pages, { profile: 'narrative' });
+		for (const [index, document] of docs.entries()) {
+			const markdown = serializePageDocument(document);
+			const parsed = parsePageDocument(markdown);
+			expect(parsed.frontmatter).toEqual(
+				expect.objectContaining({
+					runningHeaders: [index === 0 ? 'VI | Big O' : 'Vl Big O'],
+					runningFooters: [
+						index === 0
+							? 'CrackingTheCodingInterview.com | 6th Edition'
+							: 'CrackingTheCodinglnterview.com | 6th Edition',
+					],
+					printedPage: String(39 + index),
+				}),
+			);
+			expect(parsed.blocks.map(block => block.text)).toEqual([
+				'The chapter discussion continues here.',
+			]);
+		}
+		const { chapters } = stitchPagesAndGroupChapters(docs, 'Sample Book');
+		expect(chapters).toHaveLength(1);
+		expect(chapters[0]?.title).toBe('Sample Book');
+		expect(chapters[0]?.items.map(item => item.text)).not.toContain('VI | Big O');
+	});
+
+	it('detects local running headers without stripping unique chapter headings', () => {
+		const pages: OcrPageResult[] = Array.from({ length: 10 }, (_, index) => {
+			const page = 51 + index;
+			return {
+				page,
+				widthPx: 1600,
+				heightPx: 2200,
+				lines: [
+					...(page === 53 || page === 54
+						? [
+								{
+									text: 'Local Section',
+									confidence: 1,
+									bbox: { x: 0.7, y: 0.03, width: 0.2, height: 0.015 },
+								},
+							]
+						: []),
+					...(page === 53
+						? [
+								{
+									text: 'Chapter 3: A New Topic',
+									confidence: 1,
+									bbox: { x: 0.1, y: 0.08, width: 0.5, height: 0.025 },
+								},
+							]
+						: []),
+					{
+						text: 'Body text remains here.',
+						confidence: 1,
+						bbox: { x: 0.1, y: 0.2, width: 0.7, height: 0.02 },
+					},
+				],
+			};
+		});
+		const docs = processOcrPagesToDocuments(pages, { profile: 'narrative' });
+		const first = docs.find(doc => doc.frontmatter.page === 53);
+		const second = docs.find(doc => doc.frontmatter.page === 54);
+		expect(first?.frontmatter).toEqual(
+			expect.objectContaining({ runningHeaders: ['Local Section'] }),
+		);
+		expect(second?.frontmatter).toEqual(
+			expect.objectContaining({ runningHeaders: ['Local Section'] }),
+		);
+		expect(first?.blocks.some(block => block.text === 'Chapter 3: A New Topic')).toBe(true);
+		expect(first?.blocks.some(block => block.text === 'Local Section')).toBe(false);
+	});
+
+	it('prefers a footer page number over a standalone roman header', () => {
+		const page: OcrPageResult = {
+			page: 51,
+			widthPx: 1600,
+			heightPx: 2200,
+			lines: [
+				{ text: 'VI', confidence: 1, bbox: { x: 0.8, y: 0.03, width: 0.03, height: 0.015 } },
+				{ text: 'Content.', confidence: 1, bbox: { x: 0.1, y: 0.1, width: 0.7, height: 0.02 } },
+				{ text: '39', confidence: 1, bbox: { x: 0.86, y: 0.94, width: 0.03, height: 0.015 } },
+			],
+		};
+		const document = processOcrPagesToDocuments([page], { profile: 'narrative' })[0];
+		expect(document?.frontmatter).toEqual(
+			expect.objectContaining({
+				runningHeaders: ['VI'],
+				printedPage: '39',
+			}),
+		);
+	});
+
 	it('strips repeating headers, footers, and page numbers and de-hyphenates wrapped words', () => {
 		const mockPages: OcrPageResult[] = [1, 2, 3, 4].map(pageNum => ({
 			page: pageNum,
@@ -278,6 +411,33 @@ describe('multi-signal NLP confidence scoring', () => {
 });
 
 describe('OCR asymptotic-notation recovery', () => {
+	it('flags ambiguous logarithm-like notation without silently changing it', () => {
+		const page: OcrPageResult = {
+			page: 10,
+			widthPx: 1600,
+			heightPx: 2200,
+			lines: [
+				{
+					text: 'The runtime is O(1og m) or O(m 10g m).',
+					confidence: 1,
+					bbox: { x: 0.1, y: 0.2, width: 0.7, height: 0.02 },
+				},
+				{
+					text: 'The experiment used 10g of salt.',
+					confidence: 1,
+					bbox: { x: 0.1, y: 0.4, width: 0.7, height: 0.02 },
+				},
+			],
+		};
+		const document = processOcrPagesToDocuments([page], { profile: 'technical' })[0];
+		const math = document?.blocks.find(block => block.text.startsWith('The runtime'));
+		expect(math?.text).toBe('The runtime is O(1og m) or O(m 10g m).');
+		expect(math?.confidence.flagged).toBe(true);
+		expect(document?.blocks.some(block => block.text === 'The experiment used 10g of salt.')).toBe(
+			true,
+		);
+	});
+
 	it('uses nearby theta and omega labels to repair corrupted Greek symbols', () => {
 		const page: OcrPageResult = {
 			page: 51,
@@ -417,6 +577,460 @@ describe('OCR asymptotic-notation recovery', () => {
 });
 
 describe('technical layout reconstruction', () => {
+	it('flags possible section headings without silently converting ordinary list items', () => {
+		const line = (text: string, y: number, width: number) => ({
+			text,
+			confidence: 1,
+			bbox: { x: 0.1, y, width, height: 0.014 },
+		});
+		const page: OcrPageResult = {
+			page: 10,
+			widthPx: 1600,
+			heightPx: 2200,
+			lines: [
+				line('• Complexity and Memory', 0.2, 0.25),
+				line('The next paragraph explains the algorithm.', 0.24, 0.7),
+				line('• Best case: This example uses one iteration.', 0.35, 0.7),
+				line('Asymptotic Limits', 0.45, 0.25),
+				line('A detailed explanation follows this title.', 0.469, 0.7),
+			],
+		};
+		const document = processOcrPagesToDocuments([page], { profile: 'technical' })[0];
+		const possibleHeading = document?.blocks.find(block =>
+			block.text.includes('Complexity and Memory'),
+		);
+		const listItem = document?.blocks.find(block => block.text.includes('Best case:'));
+		const mergedHeading = document?.blocks.find(block => block.text.includes('Asymptotic Limits'));
+		expect(possibleHeading?.confidence.flagged).toBe(true);
+		expect(possibleHeading?.confidence.reasons).toContain('layout:verify');
+		expect(listItem?.confidence.reasons).not.toContain('layout:verify');
+		expect(mergedHeading?.confidence.reasons).toContain('layout:verify');
+	});
+
+	it('uses a corroborated text-layer row to recover a missing table cell for review', () => {
+		const line = (text: string, x: number, y: number, width: number) => ({
+			text,
+			confidence: 1,
+			bbox: { x, y, width, height: 0.012 },
+		});
+		const page: OcrPageResult = {
+			page: 10,
+			widthPx: 1600,
+			heightPx: 2200,
+			lines: [
+				line('Level', 0.1, 0.2, 0.08),
+				line('Nodes', 0.25, 0.2, 0.08),
+				line('Expression', 0.5, 0.2, 0.15),
+				line('2', 0.25, 0.22, 0.02),
+				line('2 times previous', 0.5, 0.22, 0.2),
+				line('2', 0.1, 0.24, 0.02),
+				line('4', 0.25, 0.24, 0.02),
+				line('4 total', 0.5, 0.24, 0.1),
+				line('3', 0.1, 0.26, 0.02),
+				line('8', 0.25, 0.26, 0.02),
+				line('8 total', 0.5, 0.26, 0.1),
+			],
+			textLayerLines: [line('1 2 2 times previous', 0.1, 0.22, 0.6)],
+		};
+		const document = processOcrPagesToDocuments([page], { profile: 'technical' })[0];
+		const table = document?.blocks.find(block => block.kind === 'table');
+		expect(table?.text).toContain('| 1 | 2 | 2 times previous |');
+		expect(table?.confidence.flagged).toBe(true);
+		expect(table?.confidence.reasons).toContain('table:text-layer');
+
+		const conflicting = { ...page, textLayerLines: [line('1 9', 0.1, 0.22, 0.17)] };
+		const unmatched = processOcrPagesToDocuments([conflicting], { profile: 'technical' })[0];
+		expect(unmatched?.blocks.find(block => block.kind === 'table')?.text).not.toContain(
+			'| 1 | 2 |',
+		);
+	});
+
+	it('keeps corroborated trailing braces inside a code block instead of prose', () => {
+		const line = (text: string, x: number, y: number, width = 0.1) => ({
+			text,
+			confidence: 1,
+			bbox: { x, y, width, height: 0.012 },
+		});
+		const page: OcrPageResult = {
+			page: 10,
+			widthPx: 1600,
+			heightPx: 2200,
+			lines: [
+				line('void run() {', 0.13, 0.1),
+				line('for (int a : first) {', 0.16, 0.12),
+				line('use(a);', 0.18, 0.14),
+				line('4', 0.1, 0.16),
+				line('5', 0.1, 0.18),
+				line('The algorithm is complete.', 0.1, 0.21, 0.75),
+			],
+			textLayerLines: [line('4 }', 0.1, 0.16), line('5 }', 0.1, 0.18)],
+		};
+		const document = processOcrPagesToDocuments([page], { profile: 'technical' })[0];
+		const code = document?.blocks.find(block => block.kind === 'code');
+		expect(code?.text).toBe('void run() {\n  for (int a : first) {\n    use(a);\n  }\n}');
+		expect(code?.confidence.reasons).toContain('code:text-layer');
+		expect(document?.blocks.some(block => block.text.includes('The algorithm is complete.'))).toBe(
+			true,
+		);
+	});
+
+	it('does not indent subsequent code because of braces inside string literals', () => {
+		const line = (text: string, y: number) => ({
+			text,
+			confidence: 1,
+			bbox: { x: 0.1, y, width: 0.3, height: 0.014 },
+		});
+		const page: OcrPageResult = {
+			page: 10,
+			widthPx: 1600,
+			heightPx: 2200,
+			lines: [
+				line('void run() {', 0.1),
+				line('print("{");', 0.12),
+				line('print("done");', 0.14),
+				line('}', 0.16),
+			],
+		};
+		const document = processOcrPagesToDocuments([page], { profile: 'technical' })[0];
+		expect(document?.blocks.find(block => block.kind === 'code')?.text).toBe(
+			'void run() {\n  print("{");\n  print("done");\n}',
+		);
+	});
+
+	it('does not discard a numeric literal at the start of a code line', () => {
+		const line = (text: string, y: number) => ({
+			text,
+			confidence: 1,
+			bbox: { x: 0.1, y, width: 0.3, height: 0.014 },
+		});
+		const page: OcrPageResult = {
+			page: 10,
+			widthPx: 1600,
+			heightPx: 2200,
+			lines: [line('void run() {', 0.1), line('2 + 3;', 0.12), line('}', 0.14)],
+		};
+		const document = processOcrPagesToDocuments([page], { profile: 'technical' })[0];
+		expect(document?.blocks.find(block => block.kind === 'code')?.text).toContain('2 + 3;');
+	});
+
+	it('joins adjacent OCR fragments belonging to the same code line', () => {
+		const line = (text: string, x: number, y: number, width: number) => ({
+			text,
+			confidence: 1,
+			bbox: { x, y, width, height: 0.014 },
+		});
+		const page: OcrPageResult = {
+			page: 10,
+			widthPx: 1600,
+			heightPx: 2200,
+			lines: [
+				line('void check(int x) {', 0.1, 0.1, 0.3),
+				line('if', 0.13, 0.12, 0.02),
+				line('(x > 0) {', 0.15, 0.12, 0.2),
+				line('print(x);', 0.16, 0.14, 0.2),
+				line('}', 0.13, 0.16, 0.02),
+				line('}', 0.1, 0.18, 0.02),
+			],
+		};
+		const document = processOcrPagesToDocuments([page], { profile: 'technical' })[0];
+		const code = document?.blocks.find(block => block.kind === 'code');
+		expect(code?.text).toContain('if (x > 0) {');
+		expect(code?.confidence.flagged).toBe(true);
+		expect(document?.blocks.some(block => block.kind === 'paragraph' && block.text === 'if')).toBe(
+			false,
+		);
+	});
+
+	it('does not classify side-by-side narrative sentences as code just because they contain semicolons', () => {
+		const line = (text: string, x: number, y: number) => ({
+			text,
+			confidence: 1,
+			bbox: { x, y, width: 0.25, height: 0.014 },
+		});
+		const page: OcrPageResult = {
+			page: 10,
+			widthPx: 1600,
+			heightPx: 2200,
+			lines: [
+				line('At home', 0.1, 0.1),
+				line('At work', 0.52, 0.1),
+				line('She waited; the sun rose.', 0.1, 0.13),
+				line('He waited; the rain fell.', 0.52, 0.13),
+				line('The wind blew; she smiled.', 0.1, 0.15),
+				line('The rain stopped; he smiled.', 0.52, 0.15),
+				line('She returned; dinner was ready.', 0.1, 0.17),
+				line('He returned; the day was over.', 0.52, 0.17),
+			],
+		};
+		const document = processOcrPagesToDocuments([page], { profile: 'auto' })[0];
+		expect(document?.blocks.some(block => block.kind === 'code' || block.kind === 'table')).toBe(
+			false,
+		);
+	});
+
+	it('uses a matching text-layer line to recover missing numbered code lines for review', () => {
+		const line = (text: string, x: number, y: number) => ({
+			text,
+			confidence: 1,
+			bbox: { x, y, width: 0.1, height: 0.012 },
+		});
+		const page: OcrPageResult = {
+			page: 10,
+			widthPx: 1600,
+			heightPx: 2200,
+			lines: [
+				line('void run() {', 0.13, 0.1),
+				line('for (int a : first) {', 0.16, 0.12),
+				line('use(a);', 0.18, 0.14),
+				line('for (int b : second) {', 0.16, 0.18),
+				line('use(b);', 0.18, 0.2),
+				line('7', 0.1, 0.22),
+				line('}', 0.13, 0.24),
+			],
+			textLayerLines: [
+				line('3 use(a);', 0.1, 0.14),
+				line('4 }', 0.1, 0.16),
+				line('5 for (int b : second) {', 0.1, 0.18),
+				line('7 }', 0.1, 0.22),
+			],
+		};
+		const document = processOcrPagesToDocuments([page], { profile: 'technical' })[0];
+		const code = document?.blocks.find(block => block.kind === 'code');
+		expect(code?.text).toBe(
+			'void run() {\n  for (int a : first) {\n    use(a);\n  }\n  for (int b : second) {\n    use(b);\n  }\n}',
+		);
+		expect(code?.confidence.flagged).toBe(true);
+		expect(code?.confidence.reasons).toContain('code:verify');
+		expect(code?.confidence.reasons).toContain('code:text-layer');
+
+		const conflictingLayer = {
+			...page,
+			textLayerLines: [line('9 }', 0.1, 0.16), line('8 }', 0.1, 0.22)],
+		};
+		const uncorroborated = processOcrPagesToDocuments([conflictingLayer], {
+			profile: 'technical',
+		})[0];
+		const uncorroboratedCode = uncorroborated?.blocks.find(block => block.kind === 'code');
+		expect(uncorroboratedCode?.text).not.toContain('use(a);\n  }\n  for');
+		expect(uncorroboratedCode?.confidence.flagged).toBe(true);
+		expect(uncorroboratedCode?.confidence.reasons).not.toContain('code:text-layer');
+	});
+
+	it('does not apply mathematical spelling normalization to code identifiers', () => {
+		const line = (text: string, y: number) => ({
+			text,
+			confidence: 1,
+			bbox: { x: 0.1, y, width: 0.3, height: 0.014 },
+		});
+		const page: OcrPageResult = {
+			page: 10,
+			widthPx: 1600,
+			heightPx: 2200,
+			lines: [line('void run() {', 0.1), line('o(value);', 0.12), line('}', 0.14)],
+		};
+		const document = processOcrPagesToDocuments([page], { profile: 'technical' })[0];
+		const code = document?.blocks.find(block => block.kind === 'code');
+		expect(code?.text).toContain('o(value);');
+		expect(code?.text).not.toContain('O(value);');
+	});
+
+	it('keeps a function split across consecutive pages as one code block in the EPUB', () => {
+		const line = (text: string, y: number) => ({
+			text,
+			confidence: 1,
+			bbox: { x: 0.1, y, width: 0.4, height: 0.014 },
+		});
+		const pages: OcrPageResult[] = [
+			{
+				page: 10,
+				widthPx: 1600,
+				heightPx: 2200,
+				lines: [
+					line('The following function calculates a result.', 0.72),
+					line('1 int factorial(int n) {', 0.89),
+				],
+			},
+			{
+				page: 11,
+				widthPx: 1600,
+				heightPx: 2200,
+				lines: [
+					line('if (n <= 1) {', 0.08),
+					line('return 1;', 0.1),
+					line('}', 0.12),
+					line('return factorial(n - 1);', 0.14),
+					line('}', 0.16),
+					line('The algorithm completes.', 0.22),
+				],
+			},
+		];
+		const documents = processOcrPagesToDocuments(pages, { profile: 'technical' });
+		const [first, second] = documents;
+		expect(first?.blocks.at(-1)?.kind).toBe('code');
+		expect(first?.blocks.at(-1)?.confidence.flagged).toBe(true);
+		expect(first?.frontmatter).toEqual(expect.objectContaining({ codeContinuesToNext: true }));
+		expect(second?.frontmatter).toEqual(expect.objectContaining({ codeContinuesFromPrev: true }));
+		const roundTripped = documents.map(document =>
+			parsePageDocument(serializePageDocument(document)),
+		);
+		const { chapters } = stitchPagesAndGroupChapters(roundTripped, 'Sample');
+		const codeItems = chapters
+			.flatMap(chapter => chapter.items)
+			.filter(item => item.kind === 'code');
+		expect(codeItems).toHaveLength(1);
+		expect(codeItems[0]?.sourcePages).toEqual([10, 11]);
+		expect(codeItems[0]?.text).toBe(
+			'int factorial(int n) {\n  if (n <= 1) {\n    return 1;\n  }\n  return factorial(n - 1);\n}',
+		);
+		const nonconsecutive = processOcrPagesToDocuments(
+			pages.map((page, index) => (index === 1 ? { ...page, page: 12 } : page)),
+			{ profile: 'technical' },
+		);
+		expect(nonconsecutive[0]?.frontmatter.codeContinuesToNext).toBeUndefined();
+		expect(nonconsecutive[1]?.frontmatter.codeContinuesFromPrev).toBeUndefined();
+	});
+
+	it('keeps a sparse continued code fragment with a standalone comment together', () => {
+		const line = (text: string, y: number) => ({
+			text,
+			confidence: 1,
+			bbox: { x: 0.1, y, width: 0.4, height: 0.014 },
+		});
+		const pages: OcrPageResult[] = [
+			{
+				page: 10,
+				widthPx: 1600,
+				heightPx: 2200,
+				lines: [
+					line('The following function calculates a result.', 0.72),
+					line('1 void printPairs(int[] a) {', 0.89),
+				],
+			},
+			{
+				page: 11,
+				widthPx: 1600,
+				heightPx: 2200,
+				lines: [
+					line('for (int i = 0; i < a.length; i++) {', 0.075),
+					line('for (int j = 0; j < a.length; j++) {', 0.09),
+					line('/* constant work */', 0.105),
+					line('}', 0.15),
+					line('The function performs constant work.', 0.2),
+				],
+			},
+		];
+		const documents = processOcrPagesToDocuments(pages, { profile: 'auto' });
+		expect(documents[0]?.frontmatter).toEqual(
+			expect.objectContaining({ codeContinuesToNext: true }),
+		);
+		expect(documents[1]?.frontmatter).toEqual(
+			expect.objectContaining({ codeContinuesFromPrev: true }),
+		);
+		const code = documents[1]?.blocks.find(block => block.kind === 'code');
+		expect(code?.text).toContain('/* constant work */');
+		expect(code?.confidence.flagged).toBe(true);
+	});
+
+	it('flags OCR-derived code and mathematical expressions even when OCR confidence is high', () => {
+		const line = (text: string, y: number) => ({
+			text,
+			confidence: 1,
+			bbox: { x: 0.1, y, width: 0.7, height: 0.014 },
+		});
+		const page: OcrPageResult = {
+			page: 10,
+			widthPx: 1600,
+			heightPx: 2200,
+			lines: [
+				line('She read the book and walked home.', 0.1),
+				line('The runtime of this loop is O(N?).', 0.2),
+				line('void process(int[] values) {', 0.35),
+				line('for (int i = 0; i ‹ values.length; i++) {', 0.37),
+				line('print(values[i]);', 0.39),
+				line('}', 0.41),
+				line('}', 0.43),
+			],
+		};
+		const document = processOcrPagesToDocuments([page], { profile: 'technical' })[0];
+		if (!document) throw new Error('Expected one processed page');
+		const math = document?.blocks.find(block => block.text.includes('O(N?)'));
+		const code = document?.blocks.find(block => block.kind === 'code');
+		const prose = document?.blocks.find(block => block.text.includes('walked home'));
+
+		expect(document?.frontmatter.status).toBe('needs-review');
+		expect(math?.confidence.flagged).toBe(true);
+		expect(math?.confidence.reasons).toContain('math:verify');
+		expect(code?.confidence.flagged).toBe(true);
+		expect(code?.confidence.reasons).toContain('code:verify');
+		expect(prose?.confidence.flagged).toBe(false);
+		const parsed = parsePageDocument(serializePageDocument(document));
+		expect(parsed.blocks.find(block => block.kind === 'code')?.confidence.reasons).toContain(
+			'code:verify',
+		);
+	});
+
+	it('marks ambiguous fractions and numeric pair diagrams for review', () => {
+		const line = (text: string, y: number) => ({
+			text,
+			confidence: 1,
+			bbox: { x: 0.1, y, width: 0.7, height: 0.014 },
+		});
+		const page: OcrPageResult = {
+			page: 10,
+			widthPx: 1600,
+			heightPx: 2200,
+			lines: [
+				line('After a step there are ½ elements remaining.', 0.1),
+				line('The pairs are (0, 1) (0, 2) (8, 5).', 0.2),
+			],
+		};
+		const document = processOcrPagesToDocuments([page], { profile: 'technical' })[0];
+		expect(
+			document?.blocks.filter(block => block.confidence.reasons.includes('math:verify')),
+		).toHaveLength(2);
+	});
+
+	it('keeps independently titled side-by-side code examples separate, including fragmented lines', () => {
+		const line = (text: string, x: number, y: number, width: number) => ({
+			text,
+			confidence: 1,
+			bbox: { x, y, width, height: 0.012 },
+		});
+		const page: OcrPageResult = {
+			page: 10,
+			widthPx: 1600,
+			heightPx: 2200,
+			lines: [
+				line('Sequential work', 0.14, 0.1, 0.2),
+				line('Nested work', 0.52, 0.1, 0.2),
+				line('for (int a : first) {', 0.18, 0.13, 0.2),
+				line('for (int a : first) {', 0.56, 0.13, 0.2),
+				line('consume(a);', 0.2, 0.15, 0.12),
+				line('for (int b : second) {', 0.58, 0.15, 0.2),
+				line('}', 0.18, 0.17, 0.01),
+				line('print(a +', 0.6, 0.17, 0.1),
+				line('"," + b);', 0.7, 0.17, 0.1),
+				line('for (int b : second) {', 0.18, 0.19, 0.2),
+				line('}', 0.58, 0.19, 0.01),
+				line('consume(b);', 0.2, 0.21, 0.12),
+				line('}', 0.56, 0.21, 0.01),
+				line('}', 0.18, 0.23, 0.01),
+				line('These examples have different runtimes.', 0.09, 0.27, 0.75),
+			],
+		};
+		const document = processOcrPagesToDocuments([page], { profile: 'technical' })[0];
+		const markdown = document ? serializePageDocument(document) : '';
+		const comparison = document?.blocks.find(block => block.kind === 'table');
+		expect(comparison?.confidence.flagged).toBe(true);
+		expect(comparison?.confidence.reasons).toContain('table:verify');
+		expect(markdown).toContain('<th>Sequential work</th><th>Nested work</th>');
+		expect(markdown).toContain('for (int a : first) {\n  consume(a);\n}\nfor (int b : second) {');
+		expect(markdown).toContain(
+			'for (int a : first) {\n  for (int b : second) {\n    print(a + "," + b);',
+		);
+		expect(markdown).toContain('These examples have different runtimes.');
+	});
+
 	it('keeps code snippets and side-by-side code comparisons structured', () => {
 		const page: OcrPageResult = {
 			page: 53,
@@ -674,6 +1288,61 @@ describe('technical layout reconstruction', () => {
 });
 
 describe('scan output with detected figures', () => {
+	it.skipIf(process.platform !== 'darwin' || !existsSync(join(process.cwd(), 'test/ctci.pdf')))(
+		'keeps code comparisons separate and recovers corroborated missing braces from the sample PDF',
+		async () => {
+			const result = await new VisionOcrProvider().recognizePages({
+				pdfPath: join(process.cwd(), 'test/ctci.pdf'),
+				pages: Array.from({ length: 10 }, (_, index) => 51 + index),
+				dpi: 220,
+				language: 'en',
+			});
+			const documents = processOcrPagesToDocuments(result.pages, { profile: 'auto' });
+			expect(documents).toHaveLength(10);
+			const paint = documents
+				.find(doc => doc.frontmatter.page === 51)
+				?.blocks.find(block => block.text.includes('of paint'));
+			if (paint?.text.includes('players of paint')) expect(paint.confidence.flagged).toBe(true);
+			const comparison = documents
+				.find(doc => doc.frontmatter.page === 55)
+				?.blocks.find(block => block.kind === 'table');
+			const code = documents
+				.find(doc => doc.frontmatter.page === 58)
+				?.blocks.find(block => block.kind === 'code');
+			const nodeTable = documents
+				.find(doc => doc.frontmatter.page === 57)
+				?.blocks.find(block => block.kind === 'table');
+			expect(comparison?.text).toContain('<th>Add the Runtimes:');
+			expect(comparison?.text).toContain('<th>Multiply the Runtimes:');
+			expect(comparison?.text).toContain('print(a + "," + b);');
+			expect(code?.text).toMatch(/sum\s*\+=\s*array\[i\];\n\s*}\n\s*for\s*\(/);
+			expect(code?.confidence.flagged).toBe(true);
+			expect(nodeTable?.text).toContain('| 1 | 2 |');
+			expect(nodeTable?.text).toContain('| 3 | 8 |');
+			expect(nodeTable?.text).toContain('| 4 | 16 |');
+			expect(nodeTable?.confidence.flagged).toBe(true);
+			expect(
+				documents.find(doc => doc.frontmatter.page === 56)?.frontmatter.codeContinuesToNext,
+			).toBe(true);
+			expect(
+				documents.find(doc => doc.frontmatter.page === 57)?.frontmatter.codeContinuesFromPrev,
+			).toBe(true);
+			expect(
+				documents.find(doc => doc.frontmatter.page === 59)?.frontmatter.codeContinuesToNext,
+			).toBe(true);
+			expect(
+				documents.find(doc => doc.frontmatter.page === 60)?.frontmatter.codeContinuesFromPrev,
+			).toBe(true);
+			const { chapters } = stitchPagesAndGroupChapters(documents, 'Sample');
+			const joinedCode = chapters
+				.flatMap(chapter => chapter.items)
+				.filter(item => item.kind === 'code' && item.sourcePages.length > 1);
+			expect(joinedCode.map(item => item.sourcePages)).toContainEqual([56, 57]);
+			expect(joinedCode.map(item => item.sourcePages)).toContainEqual([59, 60]);
+		},
+		30_000,
+	);
+
 	it('writes the figure crop asset referenced by the page Markdown', async () => {
 		const bookDir = createTempDir();
 		const renderCalls: RenderPageImageOptions[] = [];
@@ -1244,7 +1913,7 @@ describe('EPUB 3 stitching and archive builder', () => {
 				{
 					id: 'p2-code-1',
 					kind: 'code',
-					text: 'const n = 1;',
+					text: 'if (n < 2) {\n  n++;\n\n}',
 					bbox: { x: 0.1, y: 0.16, width: 0.3, height: 0.04 },
 					confidence: {
 						composite: 1,
@@ -1305,6 +1974,7 @@ describe('EPUB 3 stitching and archive builder', () => {
 		});
 
 		const epubPath = join(workspaceDir, 'figures.epub');
+		const markdownBeforeBuild = readFileSync(join(workspaceDir, 'pages', 'page-0002.md'), 'utf8');
 		await buildEpubFromWorkspace({ bookDir: workspaceDir, outputPath: epubPath });
 		const zip = await JSZip.loadAsync(
 			await import('node:fs/promises').then(fs => fs.readFile(epubPath)),
@@ -1318,10 +1988,37 @@ describe('EPUB 3 stitching and archive builder', () => {
 		expect(chapter).toContain(
 			'<img src="figures/page-0051-figure-01.png" alt="Figure from page 51" />',
 		);
-		expect(chapter).toContain('<pre><code>const n = 1;</code></pre>');
+		expect(chapter).toContain(
+			'<pre class="numbered-code"><code><span class="code-line">if (n &lt; 2) {</span>\n<span class="code-line">  n++;</span>\n<span class="code-line"></span>\n<span class="code-line">}</span></code></pre>',
+		);
 		expect(chapter).toContain('<table>');
-		expect(chapter).toContain('<td><pre><code>if (x &lt; min) min = x;');
-		expect(chapter).toContain('return value;</code></pre></td>');
+		expect(chapter).toContain(
+			'<td><pre class="numbered-code"><code><span class="code-line">if (x &lt; min) min = x;</span>\n<span class="code-line">  return value;</span></code></pre></td>',
+		);
+		expect(chapter).toContain(
+			'<td><pre class="numbered-code"><code><span class="code-line">int max = 0;</span></code></pre></td>',
+		);
+		const css = await zip.file('OEBPS/styles.css')?.async('string');
+		expect(css).toContain('counter-reset: code-line');
+		expect(css).toContain('counter-increment: code-line');
+		expect(css).toContain('content: counter(code-line)');
+		const codeText = [
+			...(chapter ?? '').matchAll(/<pre class="numbered-code"><code>([\s\S]*?)<\/code><\/pre>/g),
+		].map(match =>
+			(match[1] ?? '')
+				.replace(/<span class="code-line">|<\/span>/g, '')
+				.replace(/&lt;/g, '<')
+				.replace(/&gt;/g, '>')
+				.replace(/&amp;/g, '&'),
+		);
+		expect(codeText).toEqual([
+			'if (n < 2) {\n  n++;\n\n}',
+			'if (x < min) min = x;\n  return value;',
+			'int max = 0;',
+		]);
+		expect(readFileSync(join(workspaceDir, 'pages', 'page-0002.md'), 'utf8')).toBe(
+			markdownBeforeBuild,
+		);
 		expect(packageXml).toContain(
 			'href="images/cover.png" media-type="image/png" properties="cover-image"',
 		);
@@ -1339,6 +2036,341 @@ describe('CLI page option parser', () => {
 });
 
 describe('review page preview layout', () => {
+	it('shows local alternative OCR for a flagged region without changing the page', async () => {
+		const bookDir = createTempDir();
+		const now = new Date().toISOString();
+		writePageFile(bookDir, {
+			frontmatter: {
+				page: 51,
+				status: 'needs-review',
+				confidence: 0.81,
+				flaggedBlocks: 1,
+				continuesFromPrev: false,
+				continuesToNext: false,
+			},
+			blocks: [
+				{
+					id: 'p51-b1',
+					kind: 'paragraph',
+					text: 'The runtime is O(N?).',
+					bbox: { x: 0.1, y: 0.2, width: 0.7, height: 0.03 },
+					confidence: {
+						composite: 0.81,
+						ocr: 1,
+						dictionary: 1,
+						garble: 1,
+						flagged: true,
+						reasons: ['math:verify'],
+					},
+				},
+				{
+					id: 'p51-b2',
+					kind: 'paragraph',
+					text: 'A separate unflagged paragraph.',
+					bbox: { x: 0.1, y: 0.4, width: 0.7, height: 0.03 },
+					confidence: {
+						composite: 1,
+						ocr: 1,
+						dictionary: 1,
+						garble: 1,
+						flagged: false,
+						reasons: [],
+					},
+				},
+			],
+		});
+		writeBookManifest(bookDir, {
+			title: 'Test Book',
+			author: 'Test Author',
+			language: 'en',
+			sourcePdf: '/tmp/fake.pdf',
+			totalPages: 51,
+			scannedPages: [51],
+			threshold: 0.82,
+			ocrEngine: 'macos-vision',
+			createdAt: now,
+			updatedAt: now,
+			stats: { cleanPages: 0, flaggedPages: 1, reviewedPages: 0, totalFlaggedBlocks: 1 },
+		});
+		const cachedImage = join(bookDir, '.cache', 'pages', 'page-0051.png');
+		mkdirSync(dirname(cachedImage), { recursive: true });
+		const image = Buffer.alloc(24);
+		Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]).copy(image);
+		image.write('IHDR', 12, 'ascii');
+		image.writeUInt32BE(1000, 16);
+		image.writeUInt32BE(2000, 20);
+		writeFileSync(cachedImage, image);
+		const requests: Array<{
+			imagePath: string;
+			rectangle: { left: number; top: number; width: number; height: number };
+		}> = [];
+		const workerStarts: string[] = [];
+		let closed = false;
+		let failNext = false;
+		const alternativeOcr = new LocalTesseractAlternative(
+			join(bookDir, '.cache', 'tesseract-test'),
+			async language => {
+				workerStarts.push(language);
+				return {
+					recognize: async (imagePath, options) => {
+						requests.push({ imagePath, rectangle: options.rectangle });
+						if (failNext) {
+							failNext = false;
+							throw new Error('Simulated local OCR failure');
+						}
+						return { data: { text: 'The runtime is O(N²).' } };
+					},
+					terminate: async () => {
+						closed = true;
+					},
+				};
+			},
+		);
+		const pagePath = join(bookDir, 'pages', 'page-0051.md');
+		const original = readFileSync(pagePath, 'utf8');
+		const reviewServer = await startReviewServer({
+			bookDir,
+			port: await findAvailablePort(),
+			alternativeOcr,
+		});
+		try {
+			const html = await (await fetch(reviewServer.url)).text();
+			expect(html).toContain('Compare OCR');
+			expect(requests).toHaveLength(0);
+			expect(workerStarts).toHaveLength(0);
+			const response = await fetch(`${reviewServer.url}/api/pages/51/ocr-alternative`, {
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ blockId: 'p51-b1' }),
+			});
+			expect(response.ok).toBe(true);
+			expect(await response.json()).toMatchObject({
+				blockId: 'p51-b1',
+				engine: 'tesseract',
+				text: 'The runtime is O(N²).',
+			});
+			expect(requests).toEqual([
+				{ imagePath: cachedImage, rectangle: { left: 90, top: 376, width: 720, height: 109 } },
+			]);
+			expect(workerStarts).toEqual(['eng']);
+			expect(readFileSync(pagePath, 'utf8')).toBe(original);
+			expect(readPageFile(bookDir, 51).frontmatter.status).toBe('needs-review');
+			const missing = await fetch(`${reviewServer.url}/api/pages/51/ocr-alternative`, {
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ blockId: 'missing' }),
+			});
+			expect(missing.status).toBe(404);
+			const unflagged = await fetch(`${reviewServer.url}/api/pages/51/ocr-alternative`, {
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ blockId: 'p51-b2' }),
+			});
+			expect(unflagged.status).toBe(409);
+			const invalid = await fetch(`${reviewServer.url}/api/pages/51/ocr-alternative`, {
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: '{}',
+			});
+			expect(invalid.status).toBe(400);
+			expect(requests).toHaveLength(1);
+
+			const script = html.match(/<script>([\s\S]*?)<\/script>/)?.[1];
+			if (!script) throw new Error('Review page script not found');
+			type ElementStub = {
+				value: string;
+				textContent: string;
+				innerHTML: string;
+				className: string;
+				hidden: boolean;
+				disabled: boolean;
+				children: ElementStub[];
+				onclick: (() => Promise<void>) | null;
+				appendChild: (element: ElementStub) => void;
+				setAttribute: (name: string, value: string) => void;
+			};
+			const makeElement = (): ElementStub => {
+				const children: ElementStub[] = [];
+				return {
+					value: '',
+					textContent: '',
+					innerHTML: '',
+					className: '',
+					hidden: false,
+					disabled: false,
+					children,
+					onclick: null,
+					appendChild: element => {
+						children.push(element);
+					},
+					setAttribute: () => {},
+				};
+			};
+			const elements = new Map<string, ElementStub>();
+			const documentStub = {
+				getElementById: (id: string) => {
+					const element = elements.get(id) ?? makeElement();
+					elements.set(id, element);
+					return element;
+				},
+				createElement: () => makeElement(),
+				createElementNS: () => makeElement(),
+			};
+			const context = createContext({
+				document: documentStub,
+				fetch: (url: string, options?: RequestInit) => fetch(`${reviewServer.url}${url}`, options),
+				setTimeout: () => 0,
+			});
+			runInContext(script, context);
+			await runInContext('selectPage(51)', context);
+			const editor = documentStub.getElementById('md-editor');
+			editor.value = 'Unsaved user edits';
+			const row = documentStub.getElementById('flagged-container').children.at(-1);
+			const actions = row?.children.find(element => element.className === 'flagged-actions');
+			const compare = actions?.children.find(element => element.textContent === 'Compare OCR');
+			const output = row?.children.find(element => element.className === 'alternative-result');
+			expect(compare?.onclick).toBeTypeOf('function');
+			await compare?.onclick?.();
+			expect(output?.hidden).toBe(false);
+			expect(output?.textContent).toContain('The runtime is O(N²).');
+			expect(editor.value).toBe('Unsaved user edits');
+			expect(requests).toHaveLength(2);
+			expect(workerStarts).toEqual(['eng']);
+			expect(readFileSync(pagePath, 'utf8')).toBe(original);
+			failNext = true;
+			const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {});
+			try {
+				await compare?.onclick?.();
+				expect(output?.textContent).toContain('local Tesseract');
+				expect(editor.value).toBe('Unsaved user edits');
+				await compare?.onclick?.();
+				expect(output?.textContent).toContain('The runtime is O(N²).');
+			} finally {
+				errorLog.mockRestore();
+			}
+			const manifest = readBookManifest(bookDir);
+			writeBookManifest(bookDir, { ...manifest, language: 'zh-TW' });
+			const traditional = await fetch(`${reviewServer.url}/api/pages/51/ocr-alternative`, {
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ blockId: 'p51-b1' }),
+			});
+			expect(traditional.status).toBe(200);
+			expect(workerStarts).toEqual(['eng', 'chi_tra']);
+			writeBookManifest(bookDir, { ...manifest, language: 'zz' });
+			const unsupported = await fetch(`${reviewServer.url}/api/pages/51/ocr-alternative`, {
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ blockId: 'p51-b1' }),
+			});
+			expect(unsupported.status).toBe(422);
+			expect(requests).toHaveLength(5);
+		} finally {
+			await reviewServer.close();
+		}
+		expect(closed).toBe(true);
+	});
+
+	it('does not discard unsaved Markdown edits when accepting or repairing a block', async () => {
+		const reviewServer = await startReviewServer({
+			bookDir: createTempDir(),
+			port: await findAvailablePort(),
+		});
+		try {
+			const html = await (await fetch(reviewServer.url)).text();
+			const script = html.match(/<script>([\s\S]*?)<\/script>/)?.[1];
+			if (!script) throw new Error('Review page script not found');
+			type ElementStub = {
+				value: string;
+				textContent: string;
+				innerHTML: string;
+				className: string;
+				onclick: (() => void) | null;
+				appendChild: (element: ElementStub) => void;
+				setAttribute: (name: string, value: string) => void;
+			};
+			const makeElement = (): ElementStub => ({
+				value: '',
+				textContent: '',
+				innerHTML: '',
+				className: '',
+				onclick: null,
+				appendChild: () => {},
+				setAttribute: () => {},
+			});
+			const elements = new Map<string, ElementStub>();
+			const documentStub = {
+				getElementById: (id: string) => {
+					const element = elements.get(id) ?? makeElement();
+					elements.set(id, element);
+					return element;
+				},
+				createElement: () => makeElement(),
+				createElementNS: () => makeElement(),
+			};
+			let markdown = 'Original Markdown';
+			const calls: string[] = [];
+			const fakeFetch = async (url: string, options?: { method?: string; body?: string }) => {
+				calls.push(`${options?.method ?? 'GET'} ${url}`);
+				if (url === '/api/book')
+					return {
+						ok: true,
+						json: async () => ({
+							manifest: { title: 'Book' },
+							pages: [{ page: 5, status: 'needs-review', confidence: 0.8 }],
+						}),
+					};
+				if (url === '/api/pages/5' && options?.method === 'PUT') {
+					const body: unknown = JSON.parse(options.body ?? '{}');
+					if (
+						typeof body !== 'object' ||
+						body === null ||
+						!('markdown' in body) ||
+						typeof body.markdown !== 'string'
+					)
+						throw new Error('Invalid save');
+					markdown = body.markdown;
+					return { ok: true, json: async () => ({ ok: true }) };
+				}
+				if (url === '/api/pages/5')
+					return {
+						ok: true,
+						json: async () => ({
+							markdown,
+							document: { frontmatter: { status: 'needs-review', confidence: 0.8 }, blocks: [] },
+						}),
+					};
+				return {
+					ok: true,
+					json: async () => ({ repairedBlocks: 1, reviewRequiredBlocks: 1, rejectedBlocks: 0 }),
+				};
+			};
+			const context = createContext({
+				document: documentStub,
+				fetch: fakeFetch,
+				setTimeout: () => 0,
+			});
+			runInContext(script, context);
+			await runInContext('selectPage(5)', context);
+			const editor = documentStub.getElementById('md-editor');
+			editor.value = 'Unsaved corrected Markdown';
+			await runInContext('acceptBlock("p5-b1")', context);
+			await runInContext('repairBlock("p5-b1")', context);
+			await runInContext('selectPage(6)', context);
+			expect(calls).not.toContain('POST /api/pages/5/accept');
+			expect(calls).not.toContain('POST /api/pages/5/repair');
+			expect(calls).not.toContain('GET /api/pages/6');
+			expect(editor.value).toBe('Unsaved corrected Markdown');
+			expect(documentStub.getElementById('toast').textContent).toContain('Save');
+			await runInContext('savePage()', context);
+			await runInContext('acceptBlock("p5-b1")', context);
+			expect(calls).toContain('POST /api/pages/5/accept');
+			expect(markdown).toBe('Unsaved corrected Markdown');
+		} finally {
+			await reviewServer.close();
+		}
+	});
+
 	it('keeps the overlay aligned with the full image in a scrollable preview', async () => {
 		const reviewServer = await startReviewServer({
 			bookDir: createTempDir(),
@@ -1361,12 +2393,138 @@ describe('review page preview layout', () => {
 });
 
 describe('manual flagged-block review', () => {
+	it('keeps LLM suggestions for unverified code and math flagged for human review', async () => {
+		const bookDir = createTempDir();
+		const now = new Date().toISOString();
+		const confidence = (composite: number, reasons: string[]) => ({
+			composite,
+			ocr: 1,
+			dictionary: 1,
+			garble: 1,
+			flagged: true,
+			reasons,
+		});
+		writePageFile(bookDir, {
+			frontmatter: {
+				page: 5,
+				status: 'needs-review',
+				confidence: 0.6,
+				flaggedBlocks: 4,
+				continuesFromPrev: false,
+				continuesToNext: false,
+			},
+			blocks: [
+				{
+					id: 'p5-prose',
+					kind: 'paragraph',
+					text: 'A noisy sentnce.',
+					bbox: { x: 0.1, y: 0.1, width: 0.7, height: 0.03 },
+					confidence: confidence(0.6, ['ocr:0.60']),
+				},
+				{
+					id: 'p5-code',
+					kind: 'code',
+					text: 'if (x ‹ y) { return x; }',
+					bbox: { x: 0.1, y: 0.3, width: 0.7, height: 0.03 },
+					confidence: confidence(0.81, ['ocr:0.70']),
+				},
+				{
+					id: 'p5-math',
+					kind: 'paragraph',
+					text: 'The runtime is O(N?).',
+					bbox: { x: 0.1, y: 0.5, width: 0.7, height: 0.03 },
+					confidence: confidence(0.81, ['ocr:0.70']),
+				},
+				{
+					id: 'p5-table',
+					kind: 'table',
+					text: '| A | B |\n| --- | --- |\n| 1 | 2 |',
+					bbox: { x: 0.1, y: 0.7, width: 0.7, height: 0.03 },
+					confidence: confidence(0.81, ['table:verify']),
+				},
+			],
+		});
+		writeBookManifest(bookDir, {
+			title: 'Test Book',
+			author: 'Test Author',
+			language: 'en',
+			sourcePdf: '/tmp/fake.pdf',
+			totalPages: 5,
+			scannedPages: [5],
+			threshold: 0.82,
+			ocrEngine: 'macos-vision',
+			createdAt: now,
+			updatedAt: now,
+			stats: { cleanPages: 0, flaggedPages: 1, reviewedPages: 0, totalFlaggedBlocks: 4 },
+		});
+		const mockRender = async (options: RenderPageImageOptions) => {
+			mkdirSync(dirname(options.outputPath), { recursive: true });
+			writeFileSync(options.outputPath, 'mock image');
+			return options.outputPath;
+		};
+		vi.spyOn(VisionOcrProvider.prototype, 'renderPageImage').mockImplementation(mockRender);
+		vi.spyOn(TesseractOcrProvider.prototype, 'renderPageImage').mockImplementation(mockRender);
+		vi.stubEnv('OPENAI_API_KEY', 'local-test-key');
+		const response = (content: string) =>
+			new Response(JSON.stringify({ choices: [{ message: { content } }] }), {
+				status: 200,
+				headers: { 'content-type': 'application/json' },
+			});
+		vi.stubGlobal(
+			'fetch',
+			vi
+				.fn()
+				.mockResolvedValueOnce(response('A corrected sentence.'))
+				.mockResolvedValueOnce(response('if (x < y) { return x; }'))
+				.mockResolvedValueOnce(response('The runtime is O(N²).'))
+				.mockResolvedValueOnce(response('This response is not a table.')),
+		);
+		try {
+			const result = await repairFlaggedBlocks({
+				bookDir,
+				apiKey: 'local-test-key',
+				model: 'gpt-test',
+				maxBlocks: 4,
+			});
+			expect(result.repairedBlocks).toBe(3);
+			expect(result.reviewRequiredBlocks).toBe(2);
+			expect(result.rejectedBlocks).toBe(1);
+			const page = readPageFile(bookDir, 5);
+			expect(page.frontmatter.status).toBe('needs-review');
+			expect(page.frontmatter.flaggedBlocks).toBe(3);
+			expect(page.frontmatter.confidence).toBe(0.81);
+			expect(page.blocks[0]?.text).toBe('A corrected sentence.');
+			expect(page.blocks[0]?.confidence.flagged).toBe(false);
+			expect(page.blocks[1]?.text).toBe('if (x < y) { return x; }');
+			expect(page.blocks[1]?.confidence.flagged).toBe(true);
+			expect(page.blocks[1]?.confidence.reasons).toContain('code:verify');
+			expect(page.blocks[2]?.text).toBe('The runtime is O(N²).');
+			expect(page.blocks[2]?.confidence.flagged).toBe(true);
+			expect(page.blocks[2]?.confidence.reasons).toContain('math:verify');
+			expect(page.blocks[3]?.kind).toBe('table');
+			expect(page.blocks[3]?.text).toBe('| A | B |\n| --- | --- |\n| 1 | 2 |');
+			expect(page.blocks[3]?.confidence.flagged).toBe(true);
+			const epubPath = join(bookDir, 'unreviewed.epub');
+			await expect(buildEpubFromWorkspace({ bookDir, outputPath: epubPath })).rejects.toThrow(
+				'still have status "needs-review"',
+			);
+			expect(existsSync(epubPath)).toBe(false);
+		} finally {
+			vi.unstubAllGlobals();
+			vi.unstubAllEnvs();
+			vi.restoreAllMocks();
+		}
+	});
+
 	it('accepts one block at a time and completes the page after the last block', async () => {
 		const bookDir = createTempDir();
 		const now = new Date().toISOString();
 		writePageFile(bookDir, {
 			frontmatter: {
 				page: 12,
+				runningHeaders: ['VI | Big O'],
+				runningFooters: ['Cracking the Coding Interview'],
+				printedPage: 'x',
 				status: 'needs-review',
 				confidence: 0.7,
 				flaggedBlocks: 2,
@@ -1454,6 +2612,13 @@ describe('manual flagged-block review', () => {
 			const afterLastAcceptance = await loadPage();
 			expect(afterLastAcceptance.document.frontmatter.status).toBe('reviewed');
 			expect(afterLastAcceptance.document.frontmatter.flaggedBlocks).toBe(0);
+			expect(afterLastAcceptance.document.frontmatter).toEqual(
+				expect.objectContaining({
+					runningHeaders: ['VI | Big O'],
+					runningFooters: ['Cracking the Coding Interview'],
+					printedPage: 'x',
+				}),
+			);
 			expect(afterLastAcceptance.document.blocks.every(block => !block.confidence.flagged)).toBe(
 				true,
 			);

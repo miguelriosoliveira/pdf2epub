@@ -3,6 +3,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import JSZip from 'jszip';
 import { loadAllPageDocuments, readBookManifest } from '../markdown/page-serializer.ts';
+import { indentCodeContinuation, unclosedBraceDepth } from '../nlp/code-structure.ts';
 import {
 	BOOK_COVER_ASSET_PATH,
 	figureAssetPathFromMarkdown,
@@ -90,8 +91,19 @@ export function stitchPagesAndGroupChapters(
 				(pageDoc.frontmatter.continuesFromPrev ||
 					prevEndsWithHyphen ||
 					(Boolean(prevPageDoc?.frontmatter.continuesToNext) && startsLikeContinuation));
+			const shouldStitchCode =
+				isFirstBlockOnPage &&
+				itemKind === 'code' &&
+				prevItem?.kind === 'code' &&
+				prevPageDoc?.frontmatter.page === pageDoc.frontmatter.page - 1 &&
+				prevPageDoc.frontmatter.codeContinuesToNext === true &&
+				pageDoc.frontmatter.codeContinuesFromPrev === true;
 
-			if (shouldStitchWithPrevious && prevItem) {
+			if (shouldStitchCode && prevItem) {
+				prevItem.text = `${prevItem.text}\n${indentCodeContinuation(block.text, unclosedBraceDepth(prevItem.text))}`;
+				prevItem.sourcePages.push(pageDoc.frontmatter.page);
+				stitchedCount += 1;
+			} else if (shouldStitchWithPrevious && prevItem) {
 				const endsWithHyphen = /[-‐‑]$/.test(prevItem.text.trim());
 				if (endsWithHyphen && /^[a-z]/.test(block.text.trim())) {
 					prevItem.text = `${prevItem.text.trim().replace(/[-‐‑]$/, '')}${block.text.trim()}`;
@@ -183,12 +195,29 @@ function renderParagraphOrTocXhtml(text: string): string {
 	return `\t\t<p>${escapeXml(text)}</p>`;
 }
 
+function renderNumberedCode(escapedCode: string): string {
+	const lines = escapedCode
+		.split(/\r?\n/)
+		.map(line => `<span class="code-line">${line}</span>`)
+		.join('\n');
+	return `<pre class="numbered-code"><code>${lines}</code></pre>`;
+}
+
 function renderTableXhtml(markdown: string): string {
 	const comparisonTable = markdown.match(
 		/^<table>\s*<thead><tr><th>([^<]*)<\/th><th>([^<]*)<\/th><\/tr><\/thead>\s*<tbody><tr>\s*<td><pre><code>([\s\S]*?)<\/code><\/pre><\/td>\s*<td><pre><code>([\s\S]*?)<\/code><\/pre><\/td>\s*<\/tr><\/tbody>\s*<\/table>$/,
 	);
 	if (comparisonTable?.slice(1).every(value => value !== undefined && !/[<>]/.test(value))) {
-		return `\t\t${markdown.trim().replace(/\n/g, '\n\t\t')}`;
+		const [, leftHeading = '', rightHeading = '', leftCode = '', rightCode = ''] = comparisonTable;
+		return [
+			'\t\t<table>',
+			`\t\t<thead><tr><th>${leftHeading}</th><th>${rightHeading}</th></tr></thead>`,
+			'\t\t<tbody><tr>',
+			`\t\t<td>${renderNumberedCode(leftCode)}</td>`,
+			`\t\t<td>${renderNumberedCode(rightCode)}</td>`,
+			'\t\t</tr></tbody>',
+			'\t\t</table>',
+		].join('\n');
 	}
 
 	const rows = markdown
@@ -237,7 +266,7 @@ function renderChapterXhtml(chapter: EpubChapter, language: string): string {
 				return renderFigureXhtml(item.text);
 			}
 			if (item.kind === 'code') {
-				return `\t\t<pre><code>${escapeXml(item.text)}</code></pre>`;
+				return `\t\t${renderNumberedCode(escapeXml(item.text))}`;
 			}
 			if (item.kind === 'table') {
 				return renderTableXhtml(item.text);
@@ -391,6 +420,20 @@ const DEFAULT_STYLES_CSS = [
 	'p {',
 	'\tmargin: 0 0 0.85em 0;',
 	'\ttext-align: justify;',
+	'}',
+	'pre.numbered-code {',
+	'\tcounter-reset: code-line;',
+	'\toverflow-x: auto;',
+	'}',
+	'.numbered-code .code-line::before {',
+	'\tcounter-increment: code-line;',
+	'\tcontent: counter(code-line);',
+	'\tdisplay: inline-block;',
+	'\tmin-width: 3ch;',
+	'\tmargin-right: 1ch;',
+	'\ttext-align: right;',
+	'\tcolor: #777;',
+	'\tuser-select: none;',
 	'}',
 	'p.toc-row {',
 	'\tdisplay: flex;',

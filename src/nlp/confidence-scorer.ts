@@ -56,6 +56,13 @@ const DIGIT_INSIDE_WORD_REGEX = /\b[A-Za-z]+[0-9]+[A-Za-z0-9]*\b|\b[0-9]+[A-Za-z
 const STRAY_OCR_NOISE_REGEX = /[~^§¤¦¨´¸¬°±]|\|{2,}|(?<=[a-z])\|(?=[a-z])/g;
 const IMPOSSIBLE_CONSONANTS_REGEX = /\b[A-Za-z]*[bcdfghjklmnpqrstvwxz]{6,}[A-Za-z]*\b/gi;
 const REPEATED_PUNCTUATION_REGEX = /(?:[,;:]{2,}|[!?]{4,}|\.{4,})/g;
+// Text OCR confidence does not reliably establish the correctness of symbols or exponents.
+const MATHEMATICAL_NOTATION_REGEX =
+	/(?:\b[O0]\s*\([^\n)]{1,80}\)|[ΘΩθω]\s*\(|[⁰¹²³⁴⁵⁶⁷⁸⁹¼½¾⅓⅔⅛⅜⅝⅞]|\b[A-Za-z]\s*(?:[=<>≤≥×÷]|\/)\s*[A-Za-z0-9]|\(\s*\d+\s*,\s*\d+\s*\)|\b\d+\s*[+*×÷]\s*\d+|\b\d+[°ºª"])/u;
+
+export function containsMathematicalNotation(text: string): boolean {
+	return MATHEMATICAL_NOTATION_REGEX.test(text);
+}
 
 function clamp01(val: number): number {
 	return Math.min(1, Math.max(0, val));
@@ -178,6 +185,19 @@ export interface GarbleAnalysis {
 	anomalyCount: number;
 }
 
+function hasPossibleSectionHeading(block: RawReconstructedBlock): boolean {
+	if (block.kind !== 'paragraph') return false;
+	const first = block.lines[0];
+	if (!first) return false;
+	const titlePattern = /^[\p{Lu}][\p{L}\p{N}\s,&:'’–-]{2,75}$/u;
+	const bullet = first.text.trim().match(/^[•◦▪▸]\s+(.+)$/u);
+	if (bullet?.[1] && titlePattern.test(bullet[1].trim())) return true;
+	const next = block.lines[1];
+	if (!next || !titlePattern.test(first.text.trim())) return false;
+	const gap = next.bbox.y - (first.bbox.y + first.bbox.height);
+	return next.bbox.width > first.bbox.width * 1.35 && gap >= first.bbox.height * 0.35;
+}
+
 export function analyzeGarbleHeuristics(text: string): GarbleAnalysis {
 	if (!text.trim()) {
 		return { score: 1, anomalyCount: 0 };
@@ -229,6 +249,7 @@ export function scoreBlockConfidence(
 	options: {
 		threshold?: number;
 		bookVocab?: ReadonlySet<string>;
+		verifyTechnicalContent?: boolean;
 	} = {},
 ): ConfidenceBreakdown {
 	const threshold = options.threshold ?? 0.82;
@@ -253,9 +274,38 @@ export function scoreBlockConfidence(
 	const garble = isStructuredBlock
 		? { score: 1, anomalyCount: 0 }
 		: analyzeGarbleHeuristics(block.text);
-	const composite = clamp01(0.45 * ocrScore + 0.3 * dictScore + 0.25 * garble.score);
+	const baseComposite = clamp01(0.45 * ocrScore + 0.3 * dictScore + 0.25 * garble.score);
+	const verificationReason = options.verifyTechnicalContent
+		? block.kind === 'code'
+			? 'code:verify'
+			: block.kind === 'table'
+				? 'table:verify'
+				: containsMathematicalNotation(block.text)
+					? 'math:verify'
+					: undefined
+		: undefined;
+	const uncertainLayout = Boolean(
+		options.verifyTechnicalContent && hasPossibleSectionHeading(block),
+	);
+	// Unverified technical content must not appear more certain than the review threshold.
+	const composite =
+		verificationReason || uncertainLayout
+			? Math.min(baseComposite, Math.max(0, threshold - 0.01))
+			: baseComposite;
 
 	const reasons: string[] = [];
+	if (verificationReason) {
+		reasons.push(verificationReason);
+	}
+	if (uncertainLayout) {
+		reasons.push('layout:verify');
+	}
+	if (
+		(block.kind === 'code' || block.kind === 'table') &&
+		block.lines.some(line => line.source === 'text-layer')
+	) {
+		reasons.push(`${block.kind}:text-layer`);
+	}
 	if (ocrScore < threshold) {
 		reasons.push(`ocr:${ocrScore.toFixed(2)}`);
 	}
@@ -268,6 +318,8 @@ export function scoreBlockConfidence(
 	}
 
 	const flagged =
+		verificationReason !== undefined ||
+		uncertainLayout ||
 		composite < threshold ||
 		ocrScore < threshold - 0.1 ||
 		garble.anomalyCount >= 2 ||
@@ -288,6 +340,7 @@ export function scorePageBlocks(
 	options: {
 		threshold?: number;
 		bookVocab?: ReadonlySet<string>;
+		verifyTechnicalContent?: boolean;
 	} = {},
 ): TextBlock[] {
 	return rawBlocks.map(raw => ({

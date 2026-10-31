@@ -14,6 +14,9 @@ export interface ReconstructedPageLayout {
 	continuesFromPrev: boolean;
 	continuesToNext: boolean;
 	strippedHeadersFooters: string[];
+	runningHeaders: string[];
+	runningFooters: string[];
+	printedPage: string | undefined;
 }
 
 const COMPOUND_PREFIXES = new Set([
@@ -80,8 +83,34 @@ function isTopOrBottomMargin(line: OcrLine): boolean {
 	return top < 0.058 || bottom > 0.915;
 }
 
+function similarMarginKeys(left: string, right: string): boolean {
+	if (left === right) {
+		return true;
+	}
+	if (Math.min(left.length, right.length) < 8 || Math.abs(left.length - right.length) > 1) {
+		return false;
+	}
+	let leftIndex = 0;
+	let rightIndex = 0;
+	let differences = 0;
+	while (leftIndex < left.length && rightIndex < right.length) {
+		if (left[leftIndex] === right[rightIndex]) {
+			leftIndex += 1;
+			rightIndex += 1;
+			continue;
+		}
+		differences += 1;
+		if (differences > 1) {
+			return false;
+		}
+		if (left.length >= right.length) leftIndex += 1;
+		if (right.length >= left.length) rightIndex += 1;
+	}
+	return differences + Math.abs(left.length - leftIndex - (right.length - rightIndex)) <= 1;
+}
+
 export function detectRepeatingMarginKeys(pages: readonly OcrPageResult[]): Set<string> {
-	const keyCounts = new Map<string, number>();
+	const keyPages = new Map<string, Set<number>>();
 	for (const page of pages) {
 		const seenOnPage = new Set<string>();
 		for (const line of page.lines) {
@@ -91,15 +120,27 @@ export function detectRepeatingMarginKeys(pages: readonly OcrPageResult[]): Set<
 			const key = normalizeHeaderFooterKey(line.text);
 			if (key.length >= 3 && !seenOnPage.has(key)) {
 				seenOnPage.add(key);
-				keyCounts.set(key, (keyCounts.get(key) ?? 0) + 1);
+				const occurrences = keyPages.get(key) ?? new Set<number>();
+				occurrences.add(page.page);
+				keyPages.set(key, occurrences);
 			}
 		}
 	}
 
-	const minOccurrences = pages.length >= 4 ? Math.max(2, Math.floor(pages.length * 0.35)) : 3;
+	const minOccurrences = Math.max(2, Math.floor(pages.length * 0.35));
 	const repeating = new Set<string>();
-	for (const [key, count] of keyCounts) {
-		if (count >= minOccurrences) {
+	for (const [key, occurrences] of keyPages) {
+		const matchingPages = new Set(occurrences);
+		for (const [otherKey, otherPages] of keyPages) {
+			if (otherKey !== key && similarMarginKeys(key, otherKey)) {
+				for (const page of otherPages) matchingPages.add(page);
+			}
+		}
+		const orderedPages = [...matchingPages].sort((a, b) => a - b);
+		const repeatedNearby = orderedPages.some(
+			(page, index) => index > 0 && page - (orderedPages[index - 1] ?? page) <= 2,
+		);
+		if (matchingPages.size >= minOccurrences || repeatedNearby) {
 			repeating.add(key);
 		}
 	}
@@ -500,11 +541,31 @@ export function reconstructPageLayout(
 	repeatingMarginKeys: ReadonlySet<string> = new Set(),
 ): ReconstructedPageLayout {
 	const strippedHeadersFooters: string[] = [];
+	const runningHeaders: string[] = [];
+	const runningFooters: string[] = [];
+	const pageNumberCandidates = pageResult.lines.filter(
+		line =>
+			isRunningHeaderOrFooter(line, repeatingMarginKeys) &&
+			STANDALONE_PAGE_NUMBER_REGEX.test(line.text.trim()),
+	);
+	const printedPageLine =
+		pageNumberCandidates.find(line => line.bbox.y + line.bbox.height > 0.915) ??
+		pageNumberCandidates[0];
+	const printedPage = printedPageLine?.text.trim();
 	const rawContentLines: OcrLine[] = [];
 
 	for (const line of pageResult.lines) {
 		if (isRunningHeaderOrFooter(line, repeatingMarginKeys)) {
-			strippedHeadersFooters.push(line.text.trim());
+			const text = line.text.trim();
+			strippedHeadersFooters.push(text);
+			if (line === printedPageLine) {
+				continue;
+			}
+			if (line.bbox.y < 0.058) {
+				runningHeaders.push(text);
+			} else {
+				runningFooters.push(text);
+			}
 		} else {
 			rawContentLines.push(line);
 		}
@@ -517,6 +578,9 @@ export function reconstructPageLayout(
 			continuesFromPrev: false,
 			continuesToNext: false,
 			strippedHeadersFooters,
+			runningHeaders,
+			runningFooters,
+			printedPage,
 		};
 	}
 
@@ -532,6 +596,9 @@ export function reconstructPageLayout(
 			continuesFromPrev: false,
 			continuesToNext: false,
 			strippedHeadersFooters,
+			runningHeaders,
+			runningFooters,
+			printedPage,
 		};
 	}
 
@@ -578,5 +645,8 @@ export function reconstructPageLayout(
 		continuesFromPrev: detectContinuesFromPrev(blocks[0]),
 		continuesToNext: detectContinuesToNext(blocks[blocks.length - 1]),
 		strippedHeadersFooters,
+		runningHeaders,
+		runningFooters,
+		printedPage,
 	};
 }

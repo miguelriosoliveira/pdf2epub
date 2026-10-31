@@ -14,8 +14,12 @@ function clamp01(val: number): number {
 	return Math.min(1, Math.max(0, val));
 }
 
-function normalizeTesseractLang(lang = 'en'): string {
-	const cleaned = lang.toLowerCase().split('-')[0] ?? 'en';
+export function resolveTesseractLang(lang = 'en'): string | undefined {
+	const normalized = lang.trim().toLowerCase();
+	if (normalized === 'chi_sim' || normalized === 'chi_tra') return normalized;
+	const parts = normalized.split(/[-_]/);
+	const cleaned = parts[0] ?? '';
+	if (cleaned === 'zh' && ['hant', 'tw', 'hk', 'mo'].includes(parts[1] ?? '')) return 'chi_tra';
 	const map: Record<string, string> = {
 		en: 'eng',
 		pt: 'por',
@@ -23,8 +27,20 @@ function normalizeTesseractLang(lang = 'en'): string {
 		fr: 'fra',
 		de: 'deu',
 		it: 'ita',
+		nl: 'nld',
+		pl: 'pol',
+		ru: 'rus',
+		uk: 'ukr',
+		ar: 'ara',
+		ja: 'jpn',
+		ko: 'kor',
+		zh: 'chi_sim',
 	};
-	return map[cleaned] ?? 'eng';
+	return map[cleaned] ?? (/^[a-z]{3}$/.test(cleaned) ? cleaned : undefined);
+}
+
+export function normalizeTesseractLang(lang = 'en'): string {
+	return resolveTesseractLang(lang) ?? 'eng';
 }
 
 export class TesseractOcrProvider implements OcrProvider {

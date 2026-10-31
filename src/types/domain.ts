@@ -25,6 +25,7 @@ export const OcrLineSchema = z.object({
 	text: z.string(),
 	confidence: z.number().min(0).max(1),
 	bbox: NormalizedBBoxSchema,
+	source: z.enum(['text-layer']).optional(),
 });
 export type OcrLine = z.infer<typeof OcrLineSchema>;
 
@@ -33,6 +34,7 @@ export const OcrPageResultSchema = z.object({
 	widthPx: z.number().positive(),
 	heightPx: z.number().positive(),
 	lines: z.array(OcrLineSchema),
+	textLayerLines: z.array(OcrLineSchema).optional(),
 });
 export type OcrPageResult = z.infer<typeof OcrPageResultSchema>;
 
@@ -64,6 +66,11 @@ export type TextBlock = z.infer<typeof TextBlockSchema>;
 
 export const PageFrontmatterSchema = z.object({
 	page: z.number().int().positive(),
+	runningHeaders: z.array(z.string()).optional(),
+	runningFooters: z.array(z.string()).optional(),
+	printedPage: z.string().optional(),
+	codeContinuesFromPrev: z.boolean().optional(),
+	codeContinuesToNext: z.boolean().optional(),
 	status: z.enum(PAGE_STATUSES),
 	confidence: z.number().min(0).max(1),
 	flaggedBlocks: z.number().int().nonnegative(),

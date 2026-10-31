@@ -24,6 +24,7 @@ struct OcrPageResult: Codable {
 	let widthPx: Int
 	let heightPx: Int
 	let lines: [OcrLine]
+	let textLayerLines: [OcrLine]?
 }
 
 struct OcrBatchOutput: Codable {
@@ -82,7 +83,35 @@ func renderPdfPageToCGImage(page: PDFPage, dpi: Double) throws -> CGImage {
 	return cgImage
 }
 
-func recognizePage(pageNumber: Int, cgImage: CGImage, language: String) throws -> OcrPageResult {
+func textLayerLines(page: PDFPage) -> [OcrLine]? {
+	let pageRect = page.bounds(for: .mediaBox)
+	// Do not correlate text-layer coordinates with the raster when their transforms differ.
+	guard page.rotation % 360 == 0, pageRect.minX == 0, pageRect.minY == 0,
+		pageRect.width > 0, pageRect.height > 0,
+		let text = page.string, !text.isEmpty,
+		let selection = page.selection(for: NSRange(location: 0, length: (text as NSString).length))
+	else { return nil }
+
+	let lines = selection.selectionsByLine().compactMap { selectedLine -> OcrLine? in
+		guard let value = selectedLine.string?.trimmingCharacters(in: .whitespacesAndNewlines),
+			!value.isEmpty else { return nil }
+		let rect = selectedLine.bounds(for: page)
+		guard rect.width > 0, rect.height > 0 else { return nil }
+		return OcrLine(
+			text: value,
+			confidence: 0.8,
+			bbox: NormalizedBBox(
+				x: clamp01(Double(rect.minX / pageRect.width)),
+				y: clamp01(1.0 - Double(rect.maxY / pageRect.height)),
+				width: clamp01(Double(rect.width / pageRect.width)),
+				height: clamp01(Double(rect.height / pageRect.height))
+			)
+		)
+	}
+	return lines.isEmpty ? nil : lines
+}
+
+func recognizePage(pageNumber: Int, cgImage: CGImage, language: String, pdfPage: PDFPage) throws -> OcrPageResult {
 	var recognizedLines: [OcrLine] = []
 	var requestError: Error?
 
@@ -144,7 +173,8 @@ func recognizePage(pageNumber: Int, cgImage: CGImage, language: String) throws -
 		page: pageNumber,
 		widthPx: cgImage.width,
 		heightPx: cgImage.height,
-		lines: recognizedLines
+		lines: recognizedLines,
+		textLayerLines: textLayerLines(page: pdfPage)
 	)
 }
 
@@ -371,7 +401,7 @@ func run() throws {
 				guard let pdfPage = doc.page(at: p - 1) else { return }
 				do {
 					let cgImage = try renderPdfPageToCGImage(page: pdfPage, dpi: dpiArg)
-					let pageResult = try recognizePage(pageNumber: p, cgImage: cgImage, language: langArg)
+					let pageResult = try recognizePage(pageNumber: p, cgImage: cgImage, language: langArg, pdfPage: pdfPage)
 					results.append(pageResult)
 				} catch {
 					fputs("Error on page \(p): \(error)\n", stderr)

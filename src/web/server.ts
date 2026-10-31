@@ -11,7 +11,9 @@ import {
 	syncManifestStats,
 	writePageFile,
 } from '../markdown/page-serializer.ts';
+import { type AlternativeOcr, LocalTesseractAlternative } from '../ocr/alternative-ocr.ts';
 import { createOcrProvider } from '../ocr/index.ts';
+import { resolveTesseractLang } from '../ocr/tesseract-provider.ts';
 import { PAGE_STATUSES } from '../types/domain.ts';
 
 const SavePageBodySchema = z.object({
@@ -165,8 +167,10 @@ const REVIEW_APP_HTML = `<!DOCTYPE html>
 	}
 	.flagged-item {
 		display: flex;
+		flex-wrap: wrap;
 		align-items: center;
 		justify-content: space-between;
+		gap: 8px;
 		padding: 8px 10px;
 		background: rgba(245, 158, 11, 0.1);
 		border: 1px solid rgba(245, 158, 11, 0.35);
@@ -179,6 +183,18 @@ const REVIEW_APP_HTML = `<!DOCTYPE html>
 		flex-shrink: 0;
 	}
 	button.accept { color: #4ade80; border-color: rgba(34, 197, 94, 0.6); }
+	.alternative-result {
+		flex-basis: 100%;
+		margin: 0;
+		padding: 8px;
+		max-height: 16em;
+		overflow: auto;
+		white-space: pre-wrap;
+		background: #090d16;
+		border: 1px solid var(--border);
+		border-radius: 6px;
+		font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+	}
 	.status-msg { font-size: 12px; color: var(--muted); }
 </style>
 </head>
@@ -216,6 +232,7 @@ const REVIEW_APP_HTML = `<!DOCTYPE html>
 <script>
 	let pages = [];
 	let currentPage = null;
+	let loadedMarkdown = '';
 
 	const pageSelect = document.getElementById('page-select');
 	const pdfImg = document.getElementById('pdf-img');
@@ -255,6 +272,11 @@ const REVIEW_APP_HTML = `<!DOCTYPE html>
 	}
 
 	async function selectPage(pageNum) {
+		if (currentPage !== null && Number(pageNum) !== currentPage && mdEditor.value !== loadedMarkdown) {
+			pageSelect.value = String(currentPage);
+			showToast('Save Markdown before changing pages');
+			return;
+		}
 		currentPage = Number(pageNum);
 		pageSelect.value = String(currentPage);
 		pdfImg.src = '/api/pages/' + currentPage + '/image';
@@ -262,6 +284,7 @@ const REVIEW_APP_HTML = `<!DOCTYPE html>
 		const res = await fetch('/api/pages/' + currentPage);
 		const data = await res.json();
 		mdEditor.value = data.markdown;
+		loadedMarkdown = data.markdown;
 
 		const fm = data.document.frontmatter;
 		pageBadge.textContent = fm.status + ' (' + (fm.confidence * 100).toFixed(0) + '%)';
@@ -288,6 +311,12 @@ const REVIEW_APP_HTML = `<!DOCTYPE html>
 			info.textContent = block.id + ' — score ' + block.confidence.composite.toFixed(2) + ' [' + block.confidence.reasons.join(', ') + ']';
 			const actions = document.createElement('div');
 			actions.className = 'flagged-actions';
+			const alternative = document.createElement('pre');
+			alternative.className = 'alternative-result';
+			alternative.hidden = true;
+			const compareBtn = document.createElement('button');
+			compareBtn.textContent = 'Compare OCR';
+			compareBtn.onclick = () => compareOcr(block.id, compareBtn, alternative);
 			const repairBtn = document.createElement('button');
 			repairBtn.textContent = 'Repair Block with LLM';
 			repairBtn.onclick = () => repairBlock(block.id);
@@ -295,10 +324,12 @@ const REVIEW_APP_HTML = `<!DOCTYPE html>
 			acceptBtn.className = 'accept';
 			acceptBtn.textContent = 'Accept Block';
 			acceptBtn.onclick = () => acceptBlock(block.id);
+			actions.appendChild(compareBtn);
 			actions.appendChild(repairBtn);
 			actions.appendChild(acceptBtn);
 			row.appendChild(info);
 			row.appendChild(actions);
+			row.appendChild(alternative);
 			flaggedContainer.appendChild(row);
 		}
 	}
@@ -320,8 +351,35 @@ const REVIEW_APP_HTML = `<!DOCTYPE html>
 		}
 	}
 
+	async function compareOcr(blockId, button, output) {
+		if (currentPage === null) return;
+		const page = currentPage;
+		button.disabled = true;
+		output.hidden = false;
+		output.textContent = 'Running local Tesseract OCR; first use may download language data...';
+		try {
+			const res = await fetch('/api/pages/' + page + '/ocr-alternative', {
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ blockId }),
+			});
+			const data = await res.json();
+			output.textContent = res.ok
+				? 'Tesseract alternative (verify against the source):\\n' + (data.text || '[No text recognized]')
+				: 'Alternative OCR unavailable: ' + (data.error || 'Unknown error');
+		} catch {
+			output.textContent = 'Alternative OCR unavailable. Check the review server logs.';
+		} finally {
+			button.disabled = false;
+		}
+	}
+
 	async function repairBlock(blockId) {
 		if (currentPage === null) return;
+		if (mdEditor.value !== loadedMarkdown) {
+			showToast('Save Markdown before repairing a block');
+			return;
+		}
 		showToast('Calling LLM repair for ' + blockId + '...');
 		const res = await fetch('/api/pages/' + currentPage + '/repair', {
 			method: 'POST',
@@ -330,7 +388,11 @@ const REVIEW_APP_HTML = `<!DOCTYPE html>
 		});
 		const data = await res.json();
 		if (res.ok) {
-			showToast('Repaired ' + data.repairedBlocks + ' block(s)');
+			showToast(data.rejectedBlocks > 0
+				? 'Invalid repair format; original block preserved'
+				: data.reviewRequiredBlocks > 0
+					? 'Suggested ' + data.repairedBlocks + ' block(s); ' + data.reviewRequiredBlocks + ' still need review'
+					: 'Repaired ' + data.repairedBlocks + ' block(s)');
 			await loadBookOverview();
 			await selectPage(currentPage);
 		} else {
@@ -340,6 +402,10 @@ const REVIEW_APP_HTML = `<!DOCTYPE html>
 
 	async function acceptBlock(blockId) {
 		if (currentPage === null) return;
+		if (mdEditor.value !== loadedMarkdown) {
+			showToast('Save Markdown before accepting a block');
+			return;
+		}
 		const res = await fetch('/api/pages/' + currentPage + '/accept', {
 			method: 'POST',
 			headers: { 'content-type': 'application/json' },
@@ -385,9 +451,39 @@ export interface ReviewServerHandle {
 export async function startReviewServer(options: {
 	bookDir: string;
 	port?: number;
+	alternativeOcr?: AlternativeOcr;
 }): Promise<ReviewServerHandle> {
 	const port = options.port ?? 4321;
 	const { bookDir } = options;
+	const alternativeOcr =
+		options.alternativeOcr ?? new LocalTesseractAlternative(join(bookDir, '.cache/tesseract'));
+	const imageRequests = new Map<number, Promise<string>>();
+
+	async function ensurePageImage(pageNum: number): Promise<string> {
+		const cacheDir = join(bookDir, '.cache/pages');
+		const imgPath = join(cacheDir, `page-${String(pageNum).padStart(4, '0')}.png`);
+		const existing = imageRequests.get(pageNum);
+		if (existing) return existing;
+		if (existsSync(imgPath)) return imgPath;
+		const request = (async () => {
+			const manifest = readBookManifest(bookDir);
+			mkdirSync(cacheDir, { recursive: true });
+			const provider = createOcrProvider(manifest.ocrEngine);
+			await provider.renderPageImage({
+				pdfPath: manifest.sourcePdf,
+				page: pageNum,
+				outputPath: imgPath,
+				dpi: 160,
+			});
+			return imgPath;
+		})();
+		imageRequests.set(pageNum, request);
+		try {
+			return await request;
+		} finally {
+			imageRequests.delete(pageNum);
+		}
+	}
 
 	const server = createServer(async (req, res) => {
 		try {
@@ -413,20 +509,7 @@ export async function startReviewServer(options: {
 			const pageImageMatch = pathname.match(/^\/api\/pages\/(\d+)\/image$/);
 			if (req.method === 'GET' && pageImageMatch?.[1]) {
 				const pageNum = Number.parseInt(pageImageMatch[1], 10);
-				const manifest = readBookManifest(bookDir);
-				const cacheDir = join(bookDir, '.cache/pages');
-				mkdirSync(cacheDir, { recursive: true });
-				const imgPath = join(cacheDir, `page-${String(pageNum).padStart(4, '0')}.png`);
-
-				if (!existsSync(imgPath)) {
-					const provider = createOcrProvider(manifest.ocrEngine);
-					await provider.renderPageImage({
-						pdfPath: manifest.sourcePdf,
-						page: pageNum,
-						outputPath: imgPath,
-						dpi: 160,
-					});
-				}
+				const imgPath = await ensurePageImage(pageNum);
 
 				const imgBuffer = readFileSync(imgPath);
 				res.writeHead(200, {
@@ -434,6 +517,53 @@ export async function startReviewServer(options: {
 					'content-length': imgBuffer.length,
 				});
 				res.end(imgBuffer);
+				return;
+			}
+
+			const pageAlternativeMatch = pathname.match(/^\/api\/pages\/(\d+)\/ocr-alternative$/);
+			if (req.method === 'POST' && pageAlternativeMatch?.[1]) {
+				const pageNum = Number.parseInt(pageAlternativeMatch[1], 10);
+				const body = AcceptBlockBodySchema.safeParse(await readJsonBody(req));
+				if (!body.success) {
+					sendJson(res, 400, { error: 'A block ID is required' });
+					return;
+				}
+				const pagePath = join(bookDir, 'pages', formatPageFilename(pageNum));
+				if (!existsSync(pagePath)) {
+					sendJson(res, 404, { error: 'Page not found' });
+					return;
+				}
+				const pageDoc = parsePageDocument(readFileSync(pagePath, 'utf8'));
+				const block = pageDoc.blocks.find(candidate => candidate.id === body.data.blockId);
+				if (!block) {
+					sendJson(res, 404, { error: 'Block not found' });
+					return;
+				}
+				if (!block.confidence.flagged) {
+					sendJson(res, 409, { error: 'Block is not flagged' });
+					return;
+				}
+				const manifest = readBookManifest(bookDir);
+				if (!resolveTesseractLang(manifest.language)) {
+					sendJson(res, 422, {
+						error: `Unsupported Tesseract language code: ${manifest.language}`,
+					});
+					return;
+				}
+				const imagePath = await ensurePageImage(pageNum);
+				try {
+					const text = await alternativeOcr.recognize({
+						imagePath,
+						bbox: block.bbox,
+						language: manifest.language,
+					});
+					sendJson(res, 200, { blockId: block.id, engine: 'tesseract', text });
+				} catch (error) {
+					console.error('[pdf2epub] Local alternative OCR error:', error);
+					sendJson(res, 503, {
+						error: 'Could not run local Tesseract. Check language data and server logs.',
+					});
+				}
 				return;
 			}
 
@@ -540,9 +670,11 @@ export async function startReviewServer(options: {
 
 	return {
 		url: `http://127.0.0.1:${port}`,
-		close: () =>
-			new Promise<void>((resolveClose, rejectClose) => {
+		close: async () => {
+			await new Promise<void>((resolveClose, rejectClose) => {
 				server.close(err => (err ? rejectClose(err) : resolveClose()));
-			}),
+			});
+			await alternativeOcr.close();
+		},
 	};
 }

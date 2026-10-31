@@ -169,6 +169,11 @@ export function createCliProgram(): Command {
 				console.log(
 					`[pdf2epub] Repaired ${repairResult.repairedBlocks} block(s) across pages: ${repairResult.touchedPages.join(', ')}`,
 				);
+				if (repairResult.reviewRequiredBlocks || repairResult.rejectedBlocks) {
+					console.log(
+						`[pdf2epub] ${repairResult.reviewRequiredBlocks} suggestion(s) still need review; ${repairResult.rejectedBlocks} invalid response(s) left unchanged.`,
+					);
+				}
 			}
 		});
 
@@ -247,6 +252,11 @@ export function createCliProgram(): Command {
 				console.log(
 					`[pdf2epub] Repaired ${result.repairedBlocks} block(s) across ${result.touchedPages.length} page(s).`,
 				);
+				if (result.reviewRequiredBlocks || result.rejectedBlocks) {
+					console.log(
+						`[pdf2epub] ${result.reviewRequiredBlocks} suggestion(s) still need review; ${result.rejectedBlocks} invalid response(s) left unchanged.`,
+					);
+				}
 			}
 		});
 

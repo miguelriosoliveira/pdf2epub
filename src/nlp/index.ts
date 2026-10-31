@@ -1,7 +1,12 @@
 import type { LayoutProfile, OcrPageResult, PageDocument, PageStatus } from '../types/domain.ts';
+import { unclosedBraceDepth } from './code-structure.ts';
 import { buildBookVocabulary, scorePageBlocks } from './confidence-scorer.ts';
 import { detectGraphFigureRegions, figureAssetPath } from './figure-detector.ts';
-import { detectRepeatingMarginKeys, reconstructPageLayout } from './layout-reconstructor.ts';
+import {
+	detectRepeatingMarginKeys,
+	isRunningHeaderOrFooter,
+	reconstructPageLayout,
+} from './layout-reconstructor.ts';
 import { normalizeAsymptoticNotation } from './math-normalizer.ts';
 import { extractTechnicalRegions } from './technical-layout.ts';
 
@@ -17,10 +22,15 @@ export function processOcrPagesToDocuments(
 	const repeatingMarginKeys = detectRepeatingMarginKeys(pages);
 	const bookVocab = buildBookVocabulary(pages);
 
-	return pages.map(ocrPage => {
-		const technical = profile === 'narrative' ? null : extractTechnicalRegions(ocrPage, profile);
+	const documents: PageDocument[] = pages.map(ocrPage => {
+		const contentPage = {
+			...ocrPage,
+			lines: ocrPage.lines.filter(line => !isRunningHeaderOrFooter(line, repeatingMarginKeys)),
+		};
+		const technical =
+			profile === 'narrative' ? null : extractTechnicalRegions(contentPage, profile);
 		const figureRegions = [
-			...(profile === 'narrative' ? [] : detectGraphFigureRegions(ocrPage.lines)),
+			...(profile === 'narrative' ? [] : detectGraphFigureRegions(contentPage.lines)),
 			...(technical?.figureRegions ?? []),
 		];
 		const figureLabelLines = new Set(figureRegions.flatMap(region => region.labelLines));
@@ -34,12 +44,15 @@ export function processOcrPagesToDocuments(
 			...block,
 			text: normalizeAsymptoticNotation(block.text),
 		}));
-		const textBlocks = scorePageBlocks(normalizedLayoutBlocks, { threshold, bookVocab });
-		const normalizedTechnicalBlocks = (technical?.blocks ?? []).map(block => ({
-			...block,
-			text: normalizeAsymptoticNotation(block.text),
-		}));
-		const technicalBlocks = scorePageBlocks(normalizedTechnicalBlocks, { threshold, bookVocab });
+		const scoringOptions = {
+			threshold,
+			bookVocab,
+			verifyTechnicalContent: profile !== 'narrative',
+		};
+		const textBlocks = scorePageBlocks(normalizedLayoutBlocks, scoringOptions);
+		// Technical blocks contain code and structured tables: prose substitutions can change
+		// identifiers, operators, and markup, so preserve the recognized text verbatim.
+		const technicalBlocks = scorePageBlocks(technical?.blocks ?? [], scoringOptions);
 		const figureBlocks = figureRegions.map((region, index) => ({
 			id: `p${ocrPage.page}-figure-${index + 1}`,
 			kind: 'paragraph' as const,
@@ -66,6 +79,9 @@ export function processOcrPagesToDocuments(
 		return {
 			frontmatter: {
 				page: ocrPage.page,
+				...(layout.runningHeaders.length ? { runningHeaders: layout.runningHeaders } : {}),
+				...(layout.runningFooters.length ? { runningFooters: layout.runningFooters } : {}),
+				...(layout.printedPage === undefined ? {} : { printedPage: layout.printedPage }),
 				status,
 				confidence: Math.round(minBlockConfidence * 10000) / 10000,
 				flaggedBlocks,
@@ -75,6 +91,24 @@ export function processOcrPagesToDocuments(
 			blocks,
 		};
 	});
+	const documentsByPage = new Map(documents.map(document => [document.frontmatter.page, document]));
+	for (const current of documents) {
+		const previous = documentsByPage.get(current.frontmatter.page - 1);
+		const previousCode = previous?.blocks.at(-1);
+		const currentCode = current.blocks[0];
+		if (
+			previous &&
+			previousCode?.kind === 'code' &&
+			currentCode?.kind === 'code' &&
+			previousCode.bbox.y + previousCode.bbox.height >= 0.85 &&
+			currentCode.bbox.y <= 0.16 &&
+			unclosedBraceDepth(previousCode.text) > 0
+		) {
+			previous.frontmatter.codeContinuesToNext = true;
+			current.frontmatter.codeContinuesFromPrev = true;
+		}
+	}
+	return documents;
 }
 
 export * from './confidence-scorer.ts';

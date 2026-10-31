@@ -1,4 +1,5 @@
 import type { BlockKind, LayoutProfile, OcrLine, OcrPageResult } from '../types/domain.ts';
+import { unclosedBraceDepth } from './code-structure.ts';
 import type { DetectedFigureRegion } from './figure-detector.ts';
 import { mergeBBoxes, type RawReconstructedBlock } from './layout-reconstructor.ts';
 
@@ -14,6 +15,8 @@ interface OcrRow {
 }
 
 const CODE_MARKER_REGEX = /[{};]|(?:^|\s)(?:int|return|for\s*\(|if\s*\(|while\s*\(|void)\b/i;
+const CODE_STRUCTURE_REGEX =
+	/[{}]|\b(?:for|if|while|switch)\s*\(|\b(?:def|class|function|const|let|var|int|void)\s+\w+/i;
 const LINE_NUMBER_REGEX = /^\s*\d{1,2}\s*$/;
 const TREE_LABEL_REGEX = /^f\s*\(\s*\d+\s*\)?$/i;
 
@@ -66,23 +69,22 @@ function makeStructuredBlock(
 }
 
 function isCodeLine(text: string): boolean {
-	return CODE_MARKER_REGEX.test(text.trim());
+	const trimmed = text.trim();
+	return CODE_MARKER_REGEX.test(trimmed) || /^\/\*.*\*\/$/.test(trimmed) || /^\/\//.test(trimmed);
 }
 
 function stripCodeLineNumber(text: string): string {
-	return text.trim().replace(/^\d{1,2}\s+(?=\S)/, '');
+	return text.trim().replace(/^\d{1,2}\s+(?=[A-Za-z_$}{]|\/\/|\/\*)/, '');
 }
 
 function indentCodeLines(lines: readonly string[]): string[] {
-	let depth = 0;
+	let precedingText = '';
 	return lines.map(rawLine => {
 		const line = rawLine.trim();
 		const leadingClosers = line.match(/^}+/)?.[0].length ?? 0;
-		depth = Math.max(0, depth - leadingClosers);
+		const depth = Math.max(0, unclosedBraceDepth(precedingText) - leadingClosers);
 		const formatted = `${'  '.repeat(depth)}${line}`;
-		const openingBraces = line.match(/{/g)?.length ?? 0;
-		const closingBraces = (line.match(/}/g)?.length ?? 0) - leadingClosers;
-		depth = Math.max(0, depth + openingBraces - closingBraces);
+		precedingText += `${line}\n`;
 		return formatted;
 	});
 }
@@ -97,71 +99,86 @@ function createComparisonTable(
 	consumed: Set<OcrLine>,
 	index: number,
 ): RawReconstructedBlock | undefined {
-	const headings = lines
-		.filter(line => /^Min\s+and\s+Max\s+[12]$/i.test(line.text.trim()))
-		.sort((a, b) => a.bbox.x - b.bbox.x);
-	const leftHeading = headings.find(line => /\b1$/.test(line.text.trim()));
-	const rightHeading = headings.find(line => /\b2$/.test(line.text.trim()));
-	if (!leftHeading || !rightHeading) {
-		return undefined;
-	}
-	if (Math.abs(lineCenterY(leftHeading) - lineCenterY(rightHeading)) > 0.02) {
-		return undefined;
-	}
+	const available = lines.filter(line => !consumed.has(line));
+	const rows = groupRows(available, median(available.map(line => line.bbox.height)));
 
-	const headerBottom = Math.max(
-		leftHeading.bbox.y + leftHeading.bbox.height,
-		rightHeading.bbox.y + rightHeading.bbox.height,
-	);
-	const midpoint = (leftHeading.bbox.x + rightHeading.bbox.x) / 2;
-	const codeLines = lines.filter(
-		line =>
-			line.bbox.y > headerBottom &&
-			line.bbox.y < headerBottom + 0.15 &&
-			isCodeLine(line.text) &&
-			line.bbox.x > leftHeading.bbox.x - 0.02 &&
-			line.bbox.x < rightHeading.bbox.x + rightHeading.bbox.width + 0.02,
-	);
-	const leftCode = codeLines
-		.filter(line => line.bbox.x < midpoint)
-		.sort((a, b) => lineCenterY(a) - lineCenterY(b) || a.bbox.x - b.bbox.x)
-		.map(line => stripCodeLineNumber(line.text));
-	const rightCode = codeLines
-		.filter(line => line.bbox.x >= midpoint)
-		.sort((a, b) => lineCenterY(a) - lineCenterY(b) || a.bbox.x - b.bbox.x)
-		.map(line => stripCodeLineNumber(line.text));
-	if (leftCode.length < 3 || rightCode.length < 3) {
-		return undefined;
-	}
-
-	const consumedLines = [leftHeading, rightHeading, ...codeLines];
-	for (const numberLine of lines.filter(line => LINE_NUMBER_REGEX.test(line.text))) {
+	for (let headingIndex = 0; headingIndex < rows.length; headingIndex++) {
+		const headingRow = rows[headingIndex];
+		if (headingRow?.lines.length !== 2) continue;
+		const [leftHeading, rightHeading] = [...headingRow.lines].sort((a, b) => a.bbox.x - b.bbox.x);
 		if (
-			codeLines.some(
-				codeLine =>
-					Math.abs(lineCenterY(codeLine) - lineCenterY(numberLine)) < 0.009 &&
-					numberLine.bbox.x < codeLine.bbox.x,
+			!leftHeading ||
+			!rightHeading ||
+			rightHeading.bbox.x - leftHeading.bbox.x < 0.2 ||
+			leftHeading.bbox.x + leftHeading.bbox.width > rightHeading.bbox.x ||
+			[leftHeading, rightHeading].some(
+				line => line.text.length > 100 || !/\p{L}/u.test(line.text) || isCodeLine(line.text),
 			)
-		) {
-			consumedLines.push(numberLine);
-		}
-	}
-	for (const line of consumedLines) {
-		consumed.add(line);
-	}
+		)
+			continue;
 
-	const leftCodeBlock = escapeHtml(indentCodeLines(leftCode).join('\n'));
-	const rightCodeBlock = escapeHtml(indentCodeLines(rightCode).join('\n'));
-	const tableText = [
-		'<table>',
-		`<thead><tr><th>${escapeHtml(leftHeading.text.trim())}</th><th>${escapeHtml(rightHeading.text.trim())}</th></tr></thead>`,
-		'<tbody><tr>',
-		`<td><pre><code>${leftCodeBlock}</code></pre></td>`,
-		`<td><pre><code>${rightCodeBlock}</code></pre></td>`,
-		'</tr></tbody>',
-		'</table>',
-	].join('\n');
-	return makeStructuredBlock(page.page, index, 'table', tableText, consumedLines);
+		const headerBottom = Math.max(
+			leftHeading.bbox.y + leftHeading.bbox.height,
+			rightHeading.bbox.y + rightHeading.bbox.height,
+		);
+		const midpoint = (leftHeading.bbox.x + rightHeading.bbox.x) / 2;
+		const leftCode: string[] = [];
+		const rightCode: string[] = [];
+		const comparisonLines: OcrLine[] = [leftHeading, rightHeading];
+
+		for (const row of rows.slice(headingIndex + 1)) {
+			if (row.centerY - headerBottom > 0.2) break;
+			if (row.lines.some(line => line.bbox.width > 0.5)) break;
+			const segments = row.lines.filter(
+				line =>
+					line.bbox.x >= leftHeading.bbox.x - 0.025 && line.bbox.x < rightHeading.bbox.x + 0.38,
+			);
+			if (segments.length === 0) continue;
+			const left = segments.filter(
+				line => line.bbox.x < midpoint && !LINE_NUMBER_REGEX.test(line.text),
+			);
+			const right = segments.filter(
+				line => line.bbox.x >= midpoint && !LINE_NUMBER_REGEX.test(line.text),
+			);
+			const rowHasCode = [...left, ...right].some(line => isCodeLine(line.text));
+			if (!rowHasCode && (left.length > 0 || right.length > 0)) break;
+			for (const [parts, output] of [
+				[left, leftCode],
+				[right, rightCode],
+			] as const) {
+				const text = parts
+					.sort((a, b) => a.bbox.x - b.bbox.x)
+					.map(line => stripCodeLineNumber(line.text))
+					.join(' ')
+					.trim();
+				if (text) output.push(text);
+			}
+			comparisonLines.push(...segments);
+		}
+
+		if (
+			leftCode.filter(isCodeLine).length < 3 ||
+			rightCode.filter(isCodeLine).length < 3 ||
+			!leftCode.some(line => CODE_STRUCTURE_REGEX.test(line)) ||
+			!rightCode.some(line => CODE_STRUCTURE_REGEX.test(line))
+		)
+			continue;
+		for (const line of comparisonLines) consumed.add(line);
+
+		const leftCodeBlock = escapeHtml(indentCodeLines(leftCode).join('\n'));
+		const rightCodeBlock = escapeHtml(indentCodeLines(rightCode).join('\n'));
+		const tableText = [
+			'<table>',
+			`<thead><tr><th>${escapeHtml(leftHeading.text.trim())}</th><th>${escapeHtml(rightHeading.text.trim())}</th></tr></thead>`,
+			'<tbody><tr>',
+			`<td><pre><code>${leftCodeBlock}</code></pre></td>`,
+			`<td><pre><code>${rightCodeBlock}</code></pre></td>`,
+			'</tr></tbody>',
+			'</table>',
+		].join('\n');
+		return makeStructuredBlock(page.page, index, 'table', tableText, comparisonLines);
+	}
+	return undefined;
 }
 
 function createTableBlock(
@@ -216,6 +233,7 @@ function createTableBlock(
 		const normalizeHeader = (text: string, column: number) =>
 			column === 0 && /^evel$/i.test(text.trim()) ? 'Level' : text.trim();
 		const headerCells = headerLines.map((line, column) => normalizeHeader(line.text, column));
+		const textLayerEvidence: OcrLine[] = [];
 		const tableRows = rowsInTable.slice(1).map(row => {
 			const cells = anchors.map(() => '');
 			for (const line of [...row.lines].sort((a, b) => a.bbox.x - b.bbox.x)) {
@@ -231,6 +249,26 @@ function createTableBlock(
 				const value = (cells[nearest] ? `${cells[nearest]} ` : '') + line.text.trim();
 				cells[nearest] = value.replace(/\|/g, '\\|');
 			}
+			if (cells.length >= 2 && !cells[0] && /^\d+$/.test(cells[1] ?? '')) {
+				const layerLine = page.textLayerLines?.find(line => {
+					const numbers = line.text.trim().match(/^(\d+)\s+(\d+)(?:\s|$)/);
+					return (
+						numbers?.[2] === cells[1] &&
+						Math.abs(lineCenterY(line) - row.centerY) <= 0.007 &&
+						Math.abs(line.bbox.x - (anchors[0] ?? 0)) <= 0.04 &&
+						line.bbox.x + line.bbox.width >= (anchors[1] ?? 1) - 0.02
+					);
+				});
+				const missingCell = layerLine?.text.trim().match(/^(\d+)\s+(\d+)(?:\s|$)/)?.[1];
+				if (layerLine && missingCell !== undefined) {
+					cells[0] = missingCell;
+					textLayerEvidence.push({
+						...layerLine,
+						confidence: Math.min(layerLine.confidence, 0.8),
+						source: 'text-layer',
+					});
+				}
+			}
 			return cells;
 		});
 		const markdown = [
@@ -242,7 +280,10 @@ function createTableBlock(
 		for (const line of tableLines) {
 			consumed.add(line);
 		}
-		return makeStructuredBlock(page.page, index, 'table', markdown, tableLines);
+		return makeStructuredBlock(page.page, index, 'table', markdown, [
+			...tableLines,
+			...textLayerEvidence,
+		]);
 	}
 
 	return undefined;
@@ -255,9 +296,114 @@ function createCodeBlocks(
 	startIndex: number,
 	profile: LayoutProfile,
 ): RawReconstructedBlock[] {
-	const availableLines = lines.filter(line => !consumed.has(line));
+	const visibleLines = lines.filter(line => !consumed.has(line));
+	const recoveredClosers: OcrLine[] = [];
+	const textLayerLines = page.textLayerLines ?? [];
+	for (const layerLine of textLayerLines) {
+		const match = layerLine.text.trim().match(/^(\d{1,2})\s+}\s*$/);
+		if (!match?.[1]) continue;
+		const sameRow = (line: OcrLine) =>
+			Math.abs(lineCenterY(line) - lineCenterY(layerLine)) <= 0.007;
+		const marker = visibleLines.find(line => line.text.trim() === match[1] && sameRow(line));
+		if (
+			visibleLines.some(
+				line =>
+					!LINE_NUMBER_REGEX.test(line.text) &&
+					sameRow(line) &&
+					line.bbox.x > layerLine.bbox.x + 0.02,
+			)
+		)
+			continue;
+		const lineNumber = Number.parseInt(match[1], 10);
+		const corroboratesNeighbor = (number: number): boolean =>
+			textLayerLines.some(candidate => {
+				const neighbor = candidate.text.trim().match(/^(\d{1,2})\s+(.+)$/);
+				if (
+					!neighbor?.[1] ||
+					!neighbor[2] ||
+					Number.parseInt(neighbor[1], 10) !== number ||
+					Math.abs(lineCenterY(candidate) - lineCenterY(layerLine)) > 0.04
+				)
+					return false;
+				const expected = neighbor[2].replace(/\s+/g, '');
+				return visibleLines.some(
+					line =>
+						Math.abs(lineCenterY(line) - lineCenterY(candidate)) <= 0.007 &&
+						stripCodeLineNumber(line.text).replace(/\s+/g, '') === expected,
+				);
+			});
+		if (!marker && !(corroboratesNeighbor(lineNumber - 1) && corroboratesNeighbor(lineNumber + 1)))
+			continue;
+		const neighboringCode = visibleLines.filter(
+			line =>
+				isCodeLine(line.text) &&
+				line.bbox.x > layerLine.bbox.x &&
+				Math.abs(lineCenterY(line) - lineCenterY(layerLine)) <= 0.04,
+		);
+		const hasPreviousCode = neighboringCode.some(
+			line => lineCenterY(line) < lineCenterY(layerLine),
+		);
+		const hasFollowingCode = neighboringCode.some(
+			line => lineCenterY(line) > lineCenterY(layerLine),
+		);
+		if (!hasPreviousCode || !hasFollowingCode) {
+			const priorCode = [...visibleLines, ...recoveredClosers]
+				.filter(
+					line =>
+						isCodeLine(line.text) &&
+						lineCenterY(line) < lineCenterY(layerLine) &&
+						lineCenterY(layerLine) - lineCenterY(line) <= 0.12,
+				)
+				.sort((a, b) => lineCenterY(a) - lineCenterY(b));
+			const lastCode = priorCode.at(-1);
+			const interruptedByProse =
+				lastCode &&
+				visibleLines.some(
+					line =>
+						line.bbox.width > 0.5 &&
+						lineCenterY(line) > lineCenterY(lastCode) &&
+						lineCenterY(line) < lineCenterY(layerLine),
+				);
+			if (
+				!marker ||
+				priorCode.length < 2 ||
+				interruptedByProse ||
+				unclosedBraceDepth(priorCode.map(line => line.text).join('\n')) === 0
+			)
+				continue;
+		}
+		recoveredClosers.push({
+			text: '}',
+			confidence: Math.min(marker?.confidence ?? 0.8, 0.8),
+			bbox: layerLine.bbox,
+			source: 'text-layer',
+		});
+	}
+	const availableLines = [...visibleLines, ...recoveredClosers];
 	const lineHeight = median(availableLines.map(line => line.bbox.height));
-	const codeLines = availableLines.filter(line => isCodeLine(line.text));
+	const fragments = new Map<OcrLine, OcrLine[]>();
+	const usedPrefixes = new Set<OcrLine>();
+	const codeLines = availableLines
+		.filter(line => isCodeLine(line.text))
+		.map(line => {
+			const prefix = visibleLines.find(
+				candidate =>
+					!usedPrefixes.has(candidate) &&
+					/^(?:if|else|for|while|return|throw)$/i.test(candidate.text.trim()) &&
+					Math.abs(lineCenterY(candidate) - lineCenterY(line)) <= 0.007 &&
+					candidate.bbox.x < line.bbox.x &&
+					Math.abs(line.bbox.x - (candidate.bbox.x + candidate.bbox.width)) <= 0.025,
+			);
+			if (!prefix) return line;
+			usedPrefixes.add(prefix);
+			const merged: OcrLine = {
+				text: `${prefix.text.trim()} ${line.text.trim()}`,
+				confidence: Math.min(prefix.confidence, line.confidence),
+				bbox: mergeBBoxes([prefix, line]),
+			};
+			fragments.set(merged, [prefix, line]);
+			return merged;
+		});
 	const groups: OcrLine[][] = [];
 	for (const line of [...codeLines].sort((a, b) => lineCenterY(a) - lineCenterY(b))) {
 		const group = groups[groups.length - 1];
@@ -275,7 +421,13 @@ function createCodeBlocks(
 	const minimumLines = profile === 'technical' ? 2 : 3;
 	const blocks: RawReconstructedBlock[] = [];
 	for (const group of groups) {
-		if (group.length < minimumLines) {
+		const possiblePageEnd =
+			group.length === 1 &&
+			group.some(line => line.bbox.y >= 0.85 && /\b\w+\s+\w+\s*\([^)]*\)\s*\{/.test(line.text));
+		if (
+			(group.length < minimumLines && !possiblePageEnd) ||
+			!group.some(line => CODE_STRUCTURE_REGEX.test(line.text))
+		) {
 			continue;
 		}
 		const codeLines = [...group]
@@ -297,7 +449,7 @@ function createCodeBlocks(
 						codeLine.bbox.x - line.bbox.x <= 0.12,
 				),
 		);
-		const blockLines = [...group, ...lineNumbers];
+		const blockLines = [...group.flatMap(line => fragments.get(line) ?? [line]), ...lineNumbers];
 		for (const line of blockLines) {
 			consumed.add(line);
 		}

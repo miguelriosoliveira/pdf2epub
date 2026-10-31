@@ -7,6 +7,7 @@ import {
 	syncManifestStats,
 	writePageFile,
 } from '../markdown/page-serializer.ts';
+import { containsMathematicalNotation } from '../nlp/confidence-scorer.ts';
 import { createOcrProvider } from '../ocr/index.ts';
 import type { PageDocument, TextBlock } from '../types/domain.ts';
 
@@ -40,6 +41,8 @@ export interface LlmRepairOptions {
 export interface LlmRepairResult {
 	estimate: LlmCostEstimate;
 	repairedBlocks: number;
+	reviewRequiredBlocks: number;
+	rejectedBlocks: number;
 	touchedPages: number[];
 }
 
@@ -129,6 +132,7 @@ export function estimateLlmRepairCost(
 async function callMultimodalRepairModel(params: {
 	croppedPngBase64: string;
 	noisyText: string;
+	kind: TextBlock['kind'];
 	prevContext: string;
 	nextContext: string;
 	model: string;
@@ -137,8 +141,12 @@ async function callMultimodalRepairModel(params: {
 }): Promise<string> {
 	const systemPrompt = [
 		'You are an exact OCR transcription repair assistant for a scanned book.',
-		'Fix only OCR typos, garbled characters, and broken word splits in the target paragraph using the cropped scan image and surrounding context.',
-		'Return ONLY the corrected target paragraph text with no markdown fences, commentary, or explanations.',
+		'Fix only OCR typos, garbled characters, and broken word splits in the target block using the cropped scan image and surrounding context.',
+		params.kind === 'code'
+			? 'Return ONLY the corrected code, preserving its line structure and indentation, without markdown fences.'
+			: params.kind === 'table'
+				? 'Return ONLY the corrected table in the same Markdown or HTML format as the target, preserving its structure.'
+				: 'Return ONLY the corrected target text with no markdown fences, commentary, or explanations.',
 	].join(' ');
 
 	const userPrompt = [
@@ -239,6 +247,21 @@ async function callMultimodalRepairModel(params: {
 	return text;
 }
 
+function preservesStructuredFormat(block: TextBlock, repairedText: string): boolean {
+	if (block.kind === 'code') {
+		return !/^\s*```/m.test(repairedText);
+	}
+	if (block.kind !== 'table') return true;
+	if (block.text.trimStart().startsWith('<table>')) {
+		const match = repairedText.match(
+			/^<table>\s*<thead><tr><th>([^<]*)<\/th><th>([^<]*)<\/th><\/tr><\/thead>\s*<tbody><tr>\s*<td><pre><code>([\s\S]*?)<\/code><\/pre><\/td>\s*<td><pre><code>([\s\S]*?)<\/code><\/pre><\/td>\s*<\/tr><\/tbody>\s*<\/table>$/,
+		);
+		return Boolean(match?.slice(1).every(value => value !== undefined && !/[<>]/.test(value)));
+	}
+	const lines = repairedText.trim().split(/\r?\n/);
+	return /^\|.*\|$/.test(lines[0] ?? '') && /^\|(?:\s*:?-{3,}:?\s*\|)+$/.test(lines[1] ?? '');
+}
+
 export async function repairFlaggedBlocks(options: LlmRepairOptions): Promise<LlmRepairResult> {
 	const manifest = readBookManifest(options.bookDir);
 	const docs = loadAllPageDocuments(options.bookDir);
@@ -260,6 +283,8 @@ export async function repairFlaggedBlocks(options: LlmRepairOptions): Promise<Ll
 		return {
 			estimate,
 			repairedBlocks: 0,
+			reviewRequiredBlocks: 0,
+			rejectedBlocks: 0,
 			touchedPages: [],
 		};
 	}
@@ -281,6 +306,8 @@ export async function repairFlaggedBlocks(options: LlmRepairOptions): Promise<Ll
 	const selected = candidates.slice(0, maxBlocks);
 	const touchedPages = new Set<number>();
 	let repairedBlocks = 0;
+	let reviewRequiredBlocks = 0;
+	let rejectedBlocks = 0;
 
 	for (const candidate of selected) {
 		const cropPath = join(cropsDir, `${candidate.block.id}.png`);
@@ -296,6 +323,7 @@ export async function repairFlaggedBlocks(options: LlmRepairOptions): Promise<Ll
 		const callParams: {
 			croppedPngBase64: string;
 			noisyText: string;
+			kind: TextBlock['kind'];
 			prevContext: string;
 			nextContext: string;
 			model: string;
@@ -304,6 +332,7 @@ export async function repairFlaggedBlocks(options: LlmRepairOptions): Promise<Ll
 		} = {
 			croppedPngBase64,
 			noisyText: candidate.block.text,
+			kind: candidate.block.kind,
 			prevContext: candidate.prevContext,
 			nextContext: candidate.nextContext,
 			model,
@@ -318,14 +347,39 @@ export async function repairFlaggedBlocks(options: LlmRepairOptions): Promise<Ll
 		const pageDoc = docByPage.get(candidate.page);
 		const targetBlock = pageDoc?.blocks[candidate.blockIndex];
 		if (pageDoc && targetBlock) {
+			if (!preservesStructuredFormat(targetBlock, repairedText)) {
+				rejectedBlocks += 1;
+				continue;
+			}
+			const structuralReason =
+				targetBlock.kind === 'code' || targetBlock.kind === 'table'
+					? `${targetBlock.kind}:verify`
+					: undefined;
+			const mathReason =
+				!structuralReason &&
+				manifest.layoutProfile !== 'narrative' &&
+				containsMathematicalNotation(targetBlock.text)
+					? 'math:verify'
+					: undefined;
+			const requiresHumanReview =
+				structuralReason !== undefined ||
+				mathReason !== undefined ||
+				targetBlock.confidence.reasons.some(reason =>
+					/^(?:code|table|math|layout):verify$/.test(reason),
+				);
+			const retainedReasons = [...targetBlock.confidence.reasons];
+			if (structuralReason && !retainedReasons.includes(structuralReason))
+				retainedReasons.push(structuralReason);
+			if (mathReason && !retainedReasons.includes(mathReason)) retainedReasons.push(mathReason);
 			targetBlock.text = repairedText;
 			targetBlock.repairedByLlm = true;
 			targetBlock.confidence = {
 				...targetBlock.confidence,
-				composite: 0.99,
-				flagged: false,
-				reasons: ['llm-repaired'],
+				composite: requiresHumanReview ? targetBlock.confidence.composite : 0.99,
+				flagged: requiresHumanReview,
+				reasons: requiresHumanReview ? [...retainedReasons, 'llm-suggested'] : ['llm-repaired'],
 			};
+			if (requiresHumanReview) reviewRequiredBlocks += 1;
 			touchedPages.add(candidate.page);
 			repairedBlocks += 1;
 		}
@@ -338,18 +392,24 @@ export async function repairFlaggedBlocks(options: LlmRepairOptions): Promise<Ll
 		}
 		const remainingFlagged = pageDoc.blocks.filter(b => b.confidence.flagged).length;
 		pageDoc.frontmatter.flaggedBlocks = remainingFlagged;
+		pageDoc.frontmatter.confidence = pageDoc.blocks.length
+			? Math.min(...pageDoc.blocks.map(block => block.confidence.composite))
+			: 1;
 		if (remainingFlagged === 0) {
 			pageDoc.frontmatter.status = 'llm-fixed';
-			pageDoc.frontmatter.confidence = 0.99;
+		} else {
+			pageDoc.frontmatter.status = 'needs-review';
 		}
 		writePageFile(options.bookDir, pageDoc);
 	}
 
-	syncManifestStats(options.bookDir);
+	if (touchedPages.size > 0) syncManifestStats(options.bookDir);
 
 	return {
 		estimate,
 		repairedBlocks,
+		reviewRequiredBlocks,
+		rejectedBlocks,
 		touchedPages: [...touchedPages].sort((a, b) => a - b),
 	};
 }
