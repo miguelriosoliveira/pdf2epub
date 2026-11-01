@@ -7,7 +7,7 @@ import {
 	syncManifestStats,
 	writePageFile,
 } from '../markdown/page-serializer.ts';
-import { containsMathematicalNotation } from '../nlp/confidence-scorer.ts';
+import { hasDamagedTechnicalNotation } from '../nlp/confidence-scorer.ts';
 import { createOcrProvider } from '../ocr/index.ts';
 import type { PageDocument, TextBlock } from '../types/domain.ts';
 
@@ -351,26 +351,19 @@ export async function repairFlaggedBlocks(options: LlmRepairOptions): Promise<Ll
 				rejectedBlocks += 1;
 				continue;
 			}
-			const structuralReason =
-				targetBlock.kind === 'code' || targetBlock.kind === 'table'
-					? `${targetBlock.kind}:verify`
-					: undefined;
-			const mathReason =
-				!structuralReason &&
-				manifest.layoutProfile !== 'narrative' &&
-				containsMathematicalNotation(targetBlock.text)
-					? 'math:verify'
-					: undefined;
-			const requiresHumanReview =
-				structuralReason !== undefined ||
-				mathReason !== undefined ||
-				targetBlock.confidence.reasons.some(reason =>
-					/^(?:code|table|math|layout):verify$/.test(reason),
-				);
-			const retainedReasons = [...targetBlock.confidence.reasons];
-			if (structuralReason && !retainedReasons.includes(structuralReason))
-				retainedReasons.push(structuralReason);
-			if (mathReason && !retainedReasons.includes(mathReason)) retainedReasons.push(mathReason);
+			const repairStillDamaged = hasDamagedTechnicalNotation(repairedText);
+			const layoutUncertain = targetBlock.confidence.reasons.includes('layout:verify');
+			const requiresHumanReview = repairStillDamaged || layoutUncertain;
+			const retainedReasons = targetBlock.confidence.reasons.filter(
+				reason => reason !== 'llm-suggested' && reason !== 'llm-repaired',
+			);
+			if (repairStillDamaged) {
+				const damageReason =
+					targetBlock.kind === 'code' || targetBlock.kind === 'table'
+						? `${targetBlock.kind}:verify`
+						: 'math:verify';
+				if (!retainedReasons.includes(damageReason)) retainedReasons.push(damageReason);
+			}
 			targetBlock.text = repairedText;
 			targetBlock.repairedByLlm = true;
 			targetBlock.confidence = {

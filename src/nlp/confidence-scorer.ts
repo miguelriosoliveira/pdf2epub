@@ -1,6 +1,7 @@
 import dictionaryEn from 'dictionary-en';
 import nspell, { type NSpellInstance } from 'nspell';
 import type { ConfidenceBreakdown, OcrLine, OcrPageResult, TextBlock } from '../types/domain.ts';
+import { unclosedBraceDepth } from './code-structure.ts';
 import type { RawReconstructedBlock } from './layout-reconstructor.ts';
 
 let cachedSpellChecker: NSpellInstance | null = null;
@@ -56,12 +57,55 @@ const DIGIT_INSIDE_WORD_REGEX = /\b[A-Za-z]+[0-9]+[A-Za-z0-9]*\b|\b[0-9]+[A-Za-z
 const STRAY_OCR_NOISE_REGEX = /[~^§¤¦¨´¸¬°±]|\|{2,}|(?<=[a-z])\|(?=[a-z])/g;
 const IMPOSSIBLE_CONSONANTS_REGEX = /\b[A-Za-z]*[bcdfghjklmnpqrstvwxz]{6,}[A-Za-z]*\b/gi;
 const REPEATED_PUNCTUATION_REGEX = /(?:[,;:]{2,}|[!?]{4,}|\.{4,})/g;
-// Text OCR confidence does not reliably establish the correctness of symbols or exponents.
-const MATHEMATICAL_NOTATION_REGEX =
-	/(?:\b[O0]\s*\([^\n)]{1,80}\)|[ΘΩθω]\s*\(|[⁰¹²³⁴⁵⁶⁷⁸⁹¼½¾⅓⅔⅛⅜⅝⅞]|\b[A-Za-z]\s*(?:[=<>≤≥×÷]|\/)\s*[A-Za-z0-9]|\(\s*\d+\s*,\s*\d+\s*\)|\b\d+\s*[+*×÷]\s*\d+|\b\d+[°ºª"])/u;
+const OCR_ANGLE_BRACKET_REGEX = /[‹›]/u;
+const UNICODE_FRACTION_REGEX = /[¼½¾⅓⅔⅛⅜⅝⅞]/u;
+const DEGREE_ON_IDENTIFIER_REGEX = /\b[A-Za-z][º°]/u;
+const COORDINATE_DIAGRAM_REGEX = /(?:\(\s*\d+\s*,\s*\d+\s*\)\s*){2,}/;
+const BROKEN_INCREMENT_REGEX = /\b1\+\+/;
+const BROKEN_INDEX_REGEX = /\[jl\b/;
+const BROKEN_LOG_REGEX = /(?:1og|l0g|lOg)\b/;
+const TEN_G_LOG_REGEX = /10g\b/;
+const TEN_G_MASS_REGEX = /\b10g\s+of\b/;
+/** 0(, or O(...) whose exponent lost a glyph: ?, °, a quote, or N2 / N200. */
+const DAMAGED_ASYMPTOTIC_REGEX =
+	/(?:\b0\s*\()|(?:\b[OΘΩθω]\s*\([^)\n]{0,80}(?:[?º°"″]|[A-Za-z]\d))/u;
 
-export function containsMathematicalNotation(text: string): boolean {
-	return MATHEMATICAL_NOTATION_REGEX.test(text);
+/**
+ * True when technical text contains a glyph pattern local OCR gets wrong.
+ * Well-formed notation such as O(N), O(log N), or O(N²) returns false.
+ */
+export function hasDamagedTechnicalNotation(text: string): boolean {
+	const logDamaged =
+		BROKEN_LOG_REGEX.test(text) || (TEN_G_LOG_REGEX.test(text) && !TEN_G_MASS_REGEX.test(text));
+	return (
+		logDamaged ||
+		DAMAGED_ASYMPTOTIC_REGEX.test(text) ||
+		OCR_ANGLE_BRACKET_REGEX.test(text) ||
+		UNICODE_FRACTION_REGEX.test(text) ||
+		DEGREE_ON_IDENTIFIER_REGEX.test(text) ||
+		COORDINATE_DIAGRAM_REGEX.test(text) ||
+		BROKEN_INCREMENT_REGEX.test(text) ||
+		BROKEN_INDEX_REGEX.test(text)
+	);
+}
+
+function technicalVerificationReason(
+	block: RawReconstructedBlock,
+): 'code:verify' | 'table:verify' | 'math:verify' | undefined {
+	const recoveredFromTextLayer = block.lines.some(line => line.source === 'text-layer');
+	const damaged = hasDamagedTechnicalNotation(block.text);
+	if (block.kind === 'code') {
+		const continuesOntoNextPage = block.bbox.y + block.bbox.height >= 0.85;
+		const incomplete = unclosedBraceDepth(block.text) > 0 && !continuesOntoNextPage;
+		return recoveredFromTextLayer || incomplete || damaged ? 'code:verify' : undefined;
+	}
+	if (block.kind === 'table') {
+		const reconstructedComparison = /<pre\b|<code\b|```/.test(block.text);
+		return recoveredFromTextLayer || reconstructedComparison || damaged
+			? 'table:verify'
+			: undefined;
+	}
+	return damaged ? 'math:verify' : undefined;
 }
 
 function clamp01(val: number): number {
@@ -276,13 +320,7 @@ export function scoreBlockConfidence(
 		: analyzeGarbleHeuristics(block.text);
 	const baseComposite = clamp01(0.45 * ocrScore + 0.3 * dictScore + 0.25 * garble.score);
 	const verificationReason = options.verifyTechnicalContent
-		? block.kind === 'code'
-			? 'code:verify'
-			: block.kind === 'table'
-				? 'table:verify'
-				: containsMathematicalNotation(block.text)
-					? 'math:verify'
-					: undefined
+		? technicalVerificationReason(block)
 		: undefined;
 	const uncertainLayout = Boolean(
 		options.verifyTechnicalContent && hasPossibleSectionHeading(block),

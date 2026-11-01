@@ -433,9 +433,8 @@ describe('OCR asymptotic-notation recovery', () => {
 		const math = document?.blocks.find(block => block.text.startsWith('The runtime'));
 		expect(math?.text).toBe('The runtime is O(1og m) or O(m 10g m).');
 		expect(math?.confidence.flagged).toBe(true);
-		expect(document?.blocks.some(block => block.text === 'The experiment used 10g of salt.')).toBe(
-			true,
-		);
+		const salt = document?.blocks.find(block => block.text === 'The experiment used 10g of salt.');
+		expect(salt?.confidence.flagged).toBe(false);
 	});
 
 	it('uses nearby theta and omega labels to repair corrupted Greek symbols', () => {
@@ -735,7 +734,7 @@ describe('technical layout reconstruction', () => {
 		const document = processOcrPagesToDocuments([page], { profile: 'technical' })[0];
 		const code = document?.blocks.find(block => block.kind === 'code');
 		expect(code?.text).toContain('if (x > 0) {');
-		expect(code?.confidence.flagged).toBe(true);
+		expect(code?.confidence.flagged).toBe(false);
 		expect(document?.blocks.some(block => block.kind === 'paragraph' && block.text === 'if')).toBe(
 			false,
 		);
@@ -867,7 +866,7 @@ describe('technical layout reconstruction', () => {
 		const documents = processOcrPagesToDocuments(pages, { profile: 'technical' });
 		const [first, second] = documents;
 		expect(first?.blocks.at(-1)?.kind).toBe('code');
-		expect(first?.blocks.at(-1)?.confidence.flagged).toBe(true);
+		expect(first?.blocks.at(-1)?.confidence.flagged).toBe(false);
 		expect(first?.frontmatter).toEqual(expect.objectContaining({ codeContinuesToNext: true }));
 		expect(second?.frontmatter).toEqual(expect.objectContaining({ codeContinuesFromPrev: true }));
 		const roundTripped = documents.map(document =>
@@ -943,6 +942,7 @@ describe('technical layout reconstruction', () => {
 			heightPx: 2200,
 			lines: [
 				line('She read the book and walked home.', 0.1),
+				line('It is possible for O(N) code to run faster than O(1) code.', 0.15),
 				line('The runtime of this loop is O(N?).', 0.2),
 				line('void process(int[] values) {', 0.35),
 				line('for (int i = 0; i ‹ values.length; i++) {', 0.37),
@@ -956,8 +956,10 @@ describe('technical layout reconstruction', () => {
 		const math = document?.blocks.find(block => block.text.includes('O(N?)'));
 		const code = document?.blocks.find(block => block.kind === 'code');
 		const prose = document?.blocks.find(block => block.text.includes('walked home'));
+		const wellFormed = document?.blocks.find(block => block.text.includes('faster than O(1)'));
 
 		expect(document?.frontmatter.status).toBe('needs-review');
+		expect(wellFormed?.confidence.flagged).toBe(false);
 		expect(math?.confidence.flagged).toBe(true);
 		expect(math?.confidence.reasons).toContain('math:verify');
 		expect(code?.confidence.flagged).toBe(true);
@@ -1302,7 +1304,7 @@ describe('scan output with detected figures', () => {
 			const paint = documents
 				.find(doc => doc.frontmatter.page === 51)
 				?.blocks.find(block => block.text.includes('of paint'));
-			if (paint?.text.includes('players of paint')) expect(paint.confidence.flagged).toBe(true);
+			if (paint?.text.includes('players of paint')) expect(paint.confidence.flagged).toBe(false);
 			const comparison = documents
 				.find(doc => doc.frontmatter.page === 55)
 				?.blocks.find(block => block.kind === 'table');
@@ -2403,7 +2405,7 @@ describe('review page preview layout', () => {
 });
 
 describe('manual flagged-block review', () => {
-	it('keeps LLM suggestions for unverified code and math flagged for human review', async () => {
+	it('accepts an LLM repair once the code and notation are well-formed', async () => {
 		const bookDir = createTempDir();
 		const now = new Date().toISOString();
 		const confidence = (composite: number, reasons: string[]) => ({
@@ -2497,20 +2499,18 @@ describe('manual flagged-block review', () => {
 				maxBlocks: 4,
 			});
 			expect(result.repairedBlocks).toBe(3);
-			expect(result.reviewRequiredBlocks).toBe(2);
+			expect(result.reviewRequiredBlocks).toBe(0);
 			expect(result.rejectedBlocks).toBe(1);
 			const page = readPageFile(bookDir, 5);
 			expect(page.frontmatter.status).toBe('needs-review');
-			expect(page.frontmatter.flaggedBlocks).toBe(3);
+			expect(page.frontmatter.flaggedBlocks).toBe(1);
 			expect(page.frontmatter.confidence).toBe(0.81);
 			expect(page.blocks[0]?.text).toBe('A corrected sentence.');
 			expect(page.blocks[0]?.confidence.flagged).toBe(false);
 			expect(page.blocks[1]?.text).toBe('if (x < y) { return x; }');
-			expect(page.blocks[1]?.confidence.flagged).toBe(true);
-			expect(page.blocks[1]?.confidence.reasons).toContain('code:verify');
+			expect(page.blocks[1]?.confidence.flagged).toBe(false);
 			expect(page.blocks[2]?.text).toBe('The runtime is O(N²).');
-			expect(page.blocks[2]?.confidence.flagged).toBe(true);
-			expect(page.blocks[2]?.confidence.reasons).toContain('math:verify');
+			expect(page.blocks[2]?.confidence.flagged).toBe(false);
 			expect(page.blocks[3]?.kind).toBe('table');
 			expect(page.blocks[3]?.text).toBe('| A | B |\n| --- | --- |\n| 1 | 2 |');
 			expect(page.blocks[3]?.confidence.flagged).toBe(true);
