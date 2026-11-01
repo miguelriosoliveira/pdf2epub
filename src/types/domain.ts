@@ -35,6 +35,8 @@ export const OcrPageResultSchema = z.object({
 	heightPx: z.number().positive(),
 	lines: z.array(OcrLineSchema),
 	textLayerLines: z.array(OcrLineSchema).optional(),
+	/** Drawings (flowcharts, trees, diagrams) found as ink outside the recognized text. */
+	figureCandidates: z.array(NormalizedBBoxSchema).optional(),
 });
 export type OcrPageResult = z.infer<typeof OcrPageResultSchema>;
 

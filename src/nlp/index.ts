@@ -1,7 +1,11 @@
 import type { LayoutProfile, OcrPageResult, PageDocument, PageStatus } from '../types/domain.ts';
 import { unclosedBraceDepth } from './code-structure.ts';
 import { buildBookVocabulary, scorePageBlocks } from './confidence-scorer.ts';
-import { detectGraphFigureRegions, figureAssetPath } from './figure-detector.ts';
+import {
+	detectGraphFigureRegions,
+	detectInkFigureRegions,
+	figureAssetPath,
+} from './figure-detector.ts';
 import {
 	detectRepeatingMarginKeys,
 	isRunningHeaderOrFooter,
@@ -27,12 +31,24 @@ export function processOcrPagesToDocuments(
 			...ocrPage,
 			lines: ocrPage.lines.filter(line => !isRunningHeaderOrFooter(line, repeatingMarginKeys)),
 		};
+		// Drawings found by the OCR helper come first. Their labels belong to the image, so the
+		// table, code, and graph detectors must not read them as text.
+		const inkRegions =
+			profile === 'narrative'
+				? []
+				: detectInkFigureRegions(contentPage.lines, ocrPage.figureCandidates ?? []);
+		const inkLabelLines = new Set(inkRegions.flatMap(region => region.labelLines));
+		const detectionPage = {
+			...contentPage,
+			lines: contentPage.lines.filter(line => !inkLabelLines.has(line)),
+		};
 		const technical =
-			profile === 'narrative' ? null : extractTechnicalRegions(contentPage, profile);
+			profile === 'narrative' ? null : extractTechnicalRegions(detectionPage, profile);
 		const figureRegions = [
-			...(profile === 'narrative' ? [] : detectGraphFigureRegions(contentPage.lines)),
+			...inkRegions,
+			...(profile === 'narrative' ? [] : detectGraphFigureRegions(detectionPage.lines)),
 			...(technical?.figureRegions ?? []),
-		];
+		].sort((a, b) => a.bbox.y - b.bbox.y);
 		const figureLabelLines = new Set(figureRegions.flatMap(region => region.labelLines));
 		const consumedLines = new Set([...figureLabelLines, ...(technical?.consumedLines ?? [])]);
 		const layoutPage = {

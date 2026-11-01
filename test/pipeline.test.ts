@@ -21,6 +21,7 @@ import {
 	writeBookManifest,
 	writePageFile,
 } from '../src/markdown/page-serializer.ts';
+import { detectInkFigureRegions } from '../src/nlp/figure-detector.ts';
 import {
 	analyzeGarbleHeuristics,
 	buildBookVocabulary,
@@ -35,7 +36,7 @@ import type { OcrProvider, RenderPageImageOptions } from '../src/ocr/provider.ts
 import { TesseractOcrProvider } from '../src/ocr/tesseract-provider.ts';
 import { resolveOcrBatchSize, VisionOcrProvider } from '../src/ocr/vision-provider.ts';
 import { writeOcrPagesToWorkspace } from '../src/pipeline/scan-writer.ts';
-import type { OcrPageResult, PageDocument } from '../src/types/domain.ts';
+import type { NormalizedBBox, OcrLine, OcrPageResult, PageDocument } from '../src/types/domain.ts';
 import { startReviewServer } from '../src/web/server.ts';
 
 const tempDirs: string[] = [];
@@ -1472,6 +1473,135 @@ describe('scan output with detected figures', () => {
 			expect(Math.max(...margins) - Math.min(...margins)).toBeLessThanOrEqual(2);
 		},
 		30_000,
+	);
+});
+
+describe('drawings found by the OCR helper', () => {
+	const box = (x: number, y: number, width: number, height: number): NormalizedBBox => ({
+		x,
+		y,
+		width,
+		height,
+	});
+	const line = (text: string, bbox: NormalizedBBox): OcrLine => ({ text, confidence: 1, bbox });
+	const bottomOf = (region: NormalizedBBox): number => region.y + region.height;
+
+	it('claims the labels inside a drawing and grows the region to hold them', () => {
+		const start = line('Start', box(0.25, 0.35, 0.08, 0.02));
+		const end = line('End', box(0.6, 0.45, 0.06, 0.02));
+		const caption = line('Figure 2.1 shows the calls.', box(0.1, 0.7, 0.2, 0.02));
+
+		const regions = detectInkFigureRegions([start, end, caption], [box(0.2, 0.3, 0.5, 0.2)]);
+
+		expect(regions).toHaveLength(1);
+		expect(regions[0]?.labelLines).toEqual([start, end]);
+		expect(regions[0]?.bbox.y).toBeCloseTo(0.3);
+		expect(bottomOf(regions[0]?.bbox ?? box(0, 0, 0, 0))).toBeCloseTo(0.5);
+	});
+
+	it('leaves a candidate alone when running text sits inside it', () => {
+		const paragraph = line(
+			'A full line of running text that spans most of the page.',
+			box(0.1, 0.35, 0.8, 0.02),
+		);
+
+		expect(detectInkFigureRegions([paragraph], [box(0.05, 0.3, 0.9, 0.2)])).toEqual([]);
+	});
+
+	it('joins drawings stacked with only short labels between them', () => {
+		const top = box(0.14, 0.14, 0.73, 0.08);
+		const bottom = box(0.14, 0.3, 0.73, 0.54);
+		const step = line('Expand Network.', box(0.7, 0.25, 0.12, 0.02));
+
+		const regions = detectInkFigureRegions([step], [top, bottom]);
+
+		expect(regions).toHaveLength(1);
+		expect(regions[0]?.labelLines).toEqual([step]);
+		expect(regions[0]?.bbox.y).toBeCloseTo(0.14);
+		expect(bottomOf(regions[0]?.bbox ?? box(0, 0, 0, 0))).toBeCloseTo(0.84);
+	});
+
+	it('keeps stacked drawings apart when running text sits between them', () => {
+		const top = box(0.14, 0.14, 0.73, 0.08);
+		const bottom = box(0.14, 0.3, 0.73, 0.54);
+		const paragraph = line(
+			'A full line of running text that spans most of the page.',
+			box(0.1, 0.25, 0.8, 0.02),
+		);
+
+		expect(detectInkFigureRegions([paragraph], [top, bottom])).toHaveLength(2);
+	});
+
+	it('joins side-by-side drawings with a short label between them', () => {
+		const left = box(0.17, 0.23, 0.3, 0.08);
+		const right = box(0.53, 0.23, 0.29, 0.07);
+		const root = line('f(4)', box(0.47, 0.235, 0.05, 0.02));
+
+		const regions = detectInkFigureRegions([root], [left, right]);
+
+		expect(regions).toHaveLength(1);
+		expect(regions[0]?.labelLines).toEqual([root]);
+	});
+
+	it('does not join drawings separated by more than the gap limit', () => {
+		const top = box(0.14, 0.14, 0.73, 0.08);
+		const bottom = box(0.14, 0.42, 0.73, 0.4);
+		const step = line('Expand Network.', box(0.7, 0.3, 0.12, 0.02));
+
+		expect(detectInkFigureRegions([step], [top, bottom])).toHaveLength(2);
+	});
+
+	it('turns a drawing candidate into a figure block and keeps its labels out of the prose', () => {
+		const page: OcrPageResult = {
+			page: 42,
+			widthPx: 1600,
+			heightPx: 2200,
+			lines: [
+				line(
+					'The following map should give you an idea of how to tackle the interview process.',
+					box(0.1, 0.1, 0.8, 0.016),
+				),
+				line('Build projects', box(0.3, 0.3, 0.14, 0.02)),
+				line('Learn languages', box(0.6, 0.3, 0.14, 0.02)),
+			],
+			figureCandidates: [box(0.14, 0.27, 0.73, 0.1)],
+		};
+
+		const blocks = processOcrPagesToDocuments([page], { profile: 'auto' })[0]?.blocks ?? [];
+		const figures = blocks.filter(block => block.text.startsWith('![Figure from page 42]'));
+
+		expect(figures.map(block => block.text)).toEqual([
+			'![Figure from page 42](figures/page-0042-figure-01.png)',
+		]);
+		expect(blocks.some(block => block.text.includes('Learn languages'))).toBe(false);
+		expect(blocks.some(block => block.text.includes('The following map'))).toBe(true);
+	});
+
+	it.skipIf(process.platform !== 'darwin' || !existsSync(join(process.cwd(), 'test/ctci.pdf')))(
+		'finds the flowcharts on pages 42 and 43 and the tree on page 57, but not the table or code',
+		async () => {
+			const result = await new VisionOcrProvider().recognizePages({
+				pdfPath: join(process.cwd(), 'test/ctci.pdf'),
+				pages: [42, 43, 55, 57, 58],
+				dpi: 220,
+				language: 'en',
+			});
+			const documents = processOcrPagesToDocuments(result.pages, { profile: 'auto' });
+			const figuresOn = (page: number) =>
+				documents
+					.find(doc => doc.frontmatter.page === page)
+					?.blocks.filter(block => block.text.startsWith('![Figure from page')) ?? [];
+
+			expect(figuresOn(42)).toHaveLength(1);
+			expect(figuresOn(43)).toHaveLength(1);
+			expect(figuresOn(57)).toHaveLength(1);
+			expect(figuresOn(55)).toHaveLength(0);
+			expect(figuresOn(58)).toHaveLength(0);
+			const flowchart = figuresOn(42)[0]?.bbox;
+			expect(flowchart?.y).toBeLessThan(0.16);
+			expect(bottomOf(flowchart ?? box(0, 0, 0, 0))).toBeGreaterThan(0.8);
+		},
+		60_000,
 	);
 });
 
