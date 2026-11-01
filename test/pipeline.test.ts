@@ -6,7 +6,7 @@ import { createContext, runInContext } from 'node:vm';
 import { inflateSync } from 'node:zlib';
 import JSZip from 'jszip';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { parsePagesOption } from '../src/cli/index.ts';
+import { parseBatchSizeOption, parsePagesOption } from '../src/cli/index.ts';
 import { buildEpubFromWorkspace, stitchPagesAndGroupChapters } from '../src/epub/builder.ts';
 import {
 	collectFlaggedCandidates,
@@ -33,7 +33,7 @@ import {
 import { LocalTesseractAlternative } from '../src/ocr/alternative-ocr.ts';
 import type { OcrProvider, RenderPageImageOptions } from '../src/ocr/provider.ts';
 import { TesseractOcrProvider } from '../src/ocr/tesseract-provider.ts';
-import { VisionOcrProvider } from '../src/ocr/vision-provider.ts';
+import { resolveOcrBatchSize, VisionOcrProvider } from '../src/ocr/vision-provider.ts';
 import { writeOcrPagesToWorkspace } from '../src/pipeline/scan-writer.ts';
 import type { OcrPageResult, PageDocument } from '../src/types/domain.ts';
 import { startReviewServer } from '../src/web/server.ts';
@@ -2032,6 +2032,16 @@ describe('CLI page option parser', () => {
 	it('parses page range strings accurately', () => {
 		expect(parsePagesOption('all')).toBe('all');
 		expect(parsePagesOption('1-3, 7, 10-11')).toEqual([1, 2, 3, 7, 10, 11]);
+	});
+
+	it('parses a Vision batch size and can cover a whole selection', () => {
+		expect(parseBatchSizeOption(undefined)).toBe(10);
+		expect(parseBatchSizeOption('20')).toBe(20);
+		expect(parseBatchSizeOption('all')).toBe('all');
+		expect(() => parseBatchSizeOption('0')).toThrow(/positive integer/);
+		expect(resolveOcrBatchSize(20, 712)).toBe(20);
+		expect(resolveOcrBatchSize('all', 712)).toBe(712);
+		expect(resolveOcrBatchSize(undefined, 8)).toBe(8);
 	});
 });
 

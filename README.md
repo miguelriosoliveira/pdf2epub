@@ -94,13 +94,13 @@ pnpm start build ./books/my-book -o ./books/my-book/my-book.epub
 
 ## CLI Reference
 
-| Command | Description | Key Options |
-| --- | --- | --- |
-| `pnpm start scan <pdf> -o <dir>` | Run OCR + layout-aware NLP scoring and write `pages/page-NNNN.md` | `--pages <range>`, `--profile <auto\|narrative\|technical>`, `--threshold <0..1>`, `--dpi <num>`, `--engine <macos-vision\|tesseract>`, `--title`, `--author`, `--auto-llm`, `--max-llm-blocks <n>` |
-| `pnpm start status <bookDir>` | Show summary of clean, reviewed, and `needs-review` pages | — |
-| `pnpm start fix-flagged <bookDir>` | Crop flagged bounding boxes and repair via multimodal LLM | `--dry-run`, `--page <n>`, `--max-blocks <n>`, `--model <name>` |
-| `pnpm start review <bookDir>` | Launch local side-by-side PDF + Markdown review web UI | `-p, --port <port>` (default `4321`) |
-| `pnpm start build <bookDir> -o <file.epub>` | Stitch cross-page paragraphs, split chapters, and package EPUB 3 | `--allow-unreviewed` |
+| Command                                     | Description                                                       | Key Options                                                                                                                                                                                                                  |
+| ------------------------------------------- | ----------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `pnpm start scan <pdf> -o <dir>`            | Run OCR + layout-aware NLP scoring and write `pages/page-NNNN.md` | `--pages <range>`, `--batch-size <n\|all>`, `--profile <auto\|narrative\|technical>`, `--threshold <0..1>`, `--dpi <num>`, `--engine <macos-vision\|tesseract>`, `--title`, `--author`, `--auto-llm`, `--max-llm-blocks <n>` |
+| `pnpm start status <bookDir>`               | Show summary of clean, reviewed, and `needs-review` pages         | —                                                                                                                                                                                                                            |
+| `pnpm start fix-flagged <bookDir>`          | Crop flagged bounding boxes and repair via multimodal LLM         | `--dry-run`, `--page <n>`, `--max-blocks <n>`, `--model <name>`                                                                                                                                                              |
+| `pnpm start review <bookDir>`               | Launch local side-by-side PDF + Markdown review web UI            | `-p, --port <port>` (default `4321`)                                                                                                                                                                                         |
+| `pnpm start build <bookDir> -o <file.epub>` | Stitch cross-page paragraphs, split chapters, and package EPUB 3  | `--allow-unreviewed`                                                                                                                                                                                                         |
 
 ---
 

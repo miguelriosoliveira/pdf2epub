@@ -5,6 +5,8 @@ export interface OcrRecognizeOptions {
 	pages: number[] | 'all';
 	language?: string;
 	dpi?: number;
+	/** Pages read by one Vision process. `all` reads the whole selection in one process. */
+	batchSize?: number | 'all';
 	onPageProgress?: (completedPages: number, totalTargetPages: number) => void;
 }
 

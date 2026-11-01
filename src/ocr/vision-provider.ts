@@ -32,6 +32,26 @@ export function normalizeVisionLanguage(lang = 'en'): string {
 	return cleaned;
 }
 
+export const DEFAULT_OCR_BATCH_SIZE = 10;
+
+/** How many pages one Vision process should read. `all` means the whole selection. */
+export function resolveOcrBatchSize(
+	requested: number | 'all' | undefined,
+	pageCount: number,
+): number {
+	if (pageCount < 1) {
+		return 1;
+	}
+	if (requested === 'all') {
+		return pageCount;
+	}
+	const size = requested ?? DEFAULT_OCR_BATCH_SIZE;
+	if (!Number.isInteger(size) || size < 1) {
+		return Math.min(DEFAULT_OCR_BATCH_SIZE, pageCount);
+	}
+	return Math.min(size, pageCount);
+}
+
 export class VisionOcrProvider implements OcrProvider {
 	readonly engine = 'macos-vision' as const;
 
@@ -81,7 +101,7 @@ export class VisionOcrProvider implements OcrProvider {
 				? Array.from({ length: totalPages }, (_, idx) => idx + 1)
 				: options.pages.filter(p => p >= 1 && p <= totalPages);
 
-		const batchSize = 10;
+		const batchSize = resolveOcrBatchSize(options.batchSize, targetPages.length);
 		const collectedPages: OcrPageResult[] = [];
 
 		for (let i = 0; i < targetPages.length; i += batchSize) {

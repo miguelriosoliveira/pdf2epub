@@ -18,6 +18,24 @@ import { writeOcrPagesToWorkspace } from '../pipeline/scan-writer.ts';
 import { type BookManifest, LayoutProfileSchema, type OcrEngine } from '../types/domain.ts';
 import { startReviewServer } from '../web/server.ts';
 
+export function parseBatchSizeOption(raw?: string): number | 'all' {
+	if (!raw || raw.trim() === '') {
+		return 10;
+	}
+	const trimmed = raw.trim();
+	if (trimmed === 'all') {
+		return 'all';
+	}
+	if (!/^\d+$/.test(trimmed)) {
+		throw new Error(`Invalid batch size: "${raw}". Use a positive integer or "all".`);
+	}
+	const size = Number.parseInt(trimmed, 10);
+	if (size < 1) {
+		throw new Error(`Invalid batch size: "${raw}". Use a positive integer or "all".`);
+	}
+	return size;
+}
+
 export function parsePagesOption(raw?: string): number[] | 'all' {
 	if (!raw || raw.trim() === 'all') {
 		return 'all';
@@ -79,6 +97,11 @@ export function createCliProgram(): Command {
 		.option('--lang <lang>', 'OCR language code', 'en')
 		.option('--threshold <score>', 'Confidence score threshold [0..1]', '0.82')
 		.option('--dpi <dpi>', 'Render DPI for OCR', '220')
+		.option(
+			'--batch-size <n|all>',
+			'Pages per Vision OCR process. Use "all" to read the whole selection in one process',
+			'10',
+		)
 		.option('--engine <engine>', 'Force OCR engine (macos-vision | tesseract)')
 		.option('--profile <profile>', 'Layout profile (auto | narrative | technical)', 'auto')
 		.option('--title <title>', 'Book title override')
@@ -92,6 +115,9 @@ export function createCliProgram(): Command {
 			const threshold = Number.parseFloat(String(opts.threshold ?? '0.82'));
 			const dpi = Number.parseInt(String(opts.dpi ?? '220'), 10);
 			const lang = String(opts.lang ?? 'en');
+			const batchSize = parseBatchSizeOption(
+				typeof opts.batchSize === 'string' ? opts.batchSize : undefined,
+			);
 			const layoutProfile = LayoutProfileSchema.parse(opts.profile ?? 'auto');
 			const preferredEngine =
 				opts.engine === 'tesseract' || opts.engine === 'macos-vision'
@@ -100,6 +126,11 @@ export function createCliProgram(): Command {
 
 			const provider = createOcrProvider(preferredEngine);
 			console.log(`[pdf2epub] Using OCR engine: ${provider.engine}`);
+			if (provider.engine === 'macos-vision') {
+				console.log(
+					`[pdf2epub] Vision batch size: ${batchSize === 'all' ? 'all pages in one process' : batchSize}`,
+				);
+			}
 			console.log(`[pdf2epub] Scanning "${basename(pdfPath)}"...`);
 
 			const startMs = Date.now();
@@ -108,6 +139,7 @@ export function createCliProgram(): Command {
 				pages,
 				language: lang,
 				dpi,
+				batchSize,
 				onPageProgress: (done, total) => {
 					process.stdout.write(`\r[pdf2epub] OCR progress: ${done}/${total} pages`);
 				},
