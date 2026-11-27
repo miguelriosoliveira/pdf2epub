@@ -5,9 +5,9 @@
 	"type": "module",
 	"description": "Convert scanned PDF books into EPUB via local OCR, NLP confidence scoring, and per-page Markdown review",
 	"license": "MIT",
-	"packageManager": "pnpm@12.21.0",
+	"packageManager": "pnpm@12.23.0",
 	"engines": {
-		"node": ">=26.13.0"
+		"node": ">=26.13.1"
 	},
 	"bin": {
 		"pdf2epub": "./src/cli/index.ts"
@@ -32,13 +32,13 @@
 		"zod": "^4.6.7"
 	},
 	"devDependencies": {
-		"@biomejs/biome": "2.6.8",
+		"@biomejs/biome": "2.6.9",
 		"@miguelriosoliveira/shared-configs": "github:miguelriosoliveira/shared-configs",
-		"@types/node": "^26.6.6",
-		"@vitest/coverage-v8": "^5.1.1",
+		"@types/node": "^26.6.11",
+		"@vitest/coverage-v8": "^5.1.2",
 		"husky": "^9.1.7",
-		"lint-staged": "^17.6.1",
+		"lint-staged": "^17.6.2",
 		"typescript": "^7.0.2",
-		"vitest": "^5.1.1"
+		"vitest": "^5.1.2"
 	}
 }
